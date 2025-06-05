@@ -7,6 +7,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime
+from typing import Dict, Optional
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAudio
 from telegram.ext import (
@@ -14,8 +15,9 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from telegram.constants import ChatAction
+import telegram
 
-from utils.ytdl_wrapper import search_youtube, download_audio_stream, extract_playlist_videos
+from utils.ytdl_wrapper import search_youtube, download_audio_stream, extract_playlist_videos, get_video_info
 from utils.playlist_manager import PlaylistManager
 from utils.storage import StorageManager
 
@@ -29,18 +31,170 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize utility managers
+class Session:
+    """Manages user playback session state."""
+    
+    def __init__(self):
+        self.queue: list[Dict] = []
+        self.current_index: Optional[int] = None
+        self.message_id: Optional[int] = None
+        self.chat_id: Optional[int] = None
+        self.is_paused: bool = False
+        self.current_download_task: Optional[asyncio.Task] = None
+
+    def add_track(self, track_info: Dict) -> None:
+        """Add a track to the queue."""
+        self.queue.append(track_info)
+        if self.current_index is None:
+            self.current_index = 0
+
+    def get_current_track(self) -> Optional[Dict]:
+        """Get the current track info."""
+        if self.current_index is None or not self.queue:
+            return None
+        return self.queue[self.current_index]
+
+    def next_track(self) -> bool:
+        """Move to next track. Returns True if successful."""
+        if not self.queue or self.current_index is None:
+            return False
+        if self.current_index < len(self.queue) - 1:
+            self.current_index += 1
+            return True
+        return False
+
+    def prev_track(self) -> bool:
+        """Move to previous track. Returns True if successful."""
+        if not self.queue or self.current_index is None:
+            return False
+        if self.current_index > 0:
+            self.current_index -= 1
+            return True
+        return False
+
+    def clear(self) -> None:
+        """Clear the session state."""
+        self.queue.clear()
+        self.current_index = None
+        self.message_id = None
+        self.chat_id = None
+        self.is_paused = False
+        if self.current_download_task:
+            self.current_download_task.cancel()
+            self.current_download_task = None
+
+# Initialize utility managers and sessions
 playlist_manager = PlaylistManager()
 storage_manager = StorageManager()
+user_sessions: Dict[int, Session] = {}
 
+def get_session(user_id: int) -> Session:
+    """Get or create a session for the user."""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = Session()
+    return user_sessions[user_id]
+
+def build_playback_keyboard(session: Session) -> InlineKeyboardMarkup:
+    """Build the playback control keyboard."""
+    buttons = []
+    row = []
+    
+    # Previous button
+    row.append(InlineKeyboardButton("⏮️ Prev", callback_data="prev"))
+    
+    # Play/Pause button
+    if session.is_paused:
+        row.append(InlineKeyboardButton("▶️ Resume", callback_data="resume"))
+    else:
+        row.append(InlineKeyboardButton("⏸️ Pause", callback_data="pause"))
+    
+    # Next button
+    row.append(InlineKeyboardButton("⏭️ Next", callback_data="next"))
+    
+    # Stop button
+    row.append(InlineKeyboardButton("⏹️ Stop", callback_data="stop"))
+    
+    buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        "Welcome to the Music Bot! Use /search to find songs, /play to play them, and /queue to manage your queue. "
-        "You can also manage your playlists with /addtoplaylist, /myplaylists, and /removefrom."
+        "🎵 Welcome to the Music Player Bot!\n\n"
+        "🎧 How to use the player:\n"
+        "1. Use /search to find music\n"
+        "2. Select a track to start playing\n"
+        "3. Control playback with the buttons below the 'Now Playing' message:\n"
+        "   ⏮️ Previous track\n"
+        "   ⏸️ Pause / ▶️ Resume\n"
+        "   ⏭️ Next track\n"
+        "   ⏹️ Stop playback\n\n"
+        "📋 Other commands:\n"
+        "• /play <URL> - Play a video or playlist\n"
+        "• /queue - View your current queue\n"
+        "• /next - Skip to next track\n"
+        "• /history - View your play history\n\n"
+        "💡 Tip: The 'Now Playing' message stays in place and updates as you control playback!"
     )
 
+
+async def playback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle playback control callbacks (prev, pause, resume, next, stop)."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except telegram.error.BadRequest as e:
+        if "Query is too old" in str(e):
+            # Ignore old query errors
+            pass
+        else:
+            raise
+    
+    user_id = query.from_user.id
+    session = get_session(user_id)
+    action = query.data
+    
+    if action == "prev":
+        if session.prev_track():
+            await start_next(context, user_id)
+    elif action == "pause":
+        session.is_paused = True
+        try:
+            await query.edit_message_reply_markup(reply_markup=build_playback_keyboard(session))
+        except telegram.error.BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+    elif action == "resume":
+        session.is_paused = False
+        try:
+            await query.edit_message_reply_markup(reply_markup=build_playback_keyboard(session))
+        except telegram.error.BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+        await start_next(context, user_id)
+    elif action == "next":
+        if session.next_track():
+            await start_next(context, user_id)
+        else:
+            try:
+                await query.edit_message_text(
+                    text="❌ Queue is empty. Use /search to add more tracks.",
+                    reply_markup=build_playback_keyboard(session)
+                )
+            except telegram.error.BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    raise
+    elif action == "stop":
+        if session.message_id and session.chat_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=session.chat_id,
+                    message_id=session.message_id
+                )
+            except Exception as e:
+                logger.error(f"Error deleting message: {e}")
+        session.clear()
+        user_sessions.pop(user_id, None)
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /search command - search YouTube and return results with inline keyboard."""
@@ -106,45 +260,139 @@ async def predownload_next(user_id):
         await loop.run_in_executor(None, download_audio_stream, url, user_id)
 
 
+async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Start playing the next track in the queue."""
+    session = get_session(user_id)
+    if not session.queue or session.current_index is None:
+        return
+
+    track = session.get_current_track()
+    if not track:
+        return
+
+    try:
+        # Update the "Now Playing" message
+        message_text = f"🎵 Now Playing: {track['title']}"
+        if session.message_id and session.chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.message_id,
+                    text=message_text,
+                    reply_markup=build_playback_keyboard(session)
+                )
+            except telegram.error.BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    logger.error(f"Error updating message: {e}")
+                    # Session might have expired
+                    session.clear()
+                    user_sessions.pop(user_id, None)
+                    return
+            except Exception as e:
+                logger.error(f"Error updating message: {e}")
+                # Session might have expired
+                session.clear()
+                user_sessions.pop(user_id, None)
+                return
+        else:
+            # Create new "Now Playing" message if it doesn't exist
+            message = await context.bot.send_message(
+                chat_id=session.chat_id,
+                text=message_text,
+                reply_markup=build_playback_keyboard(session)
+            )
+            session.message_id = message.message_id
+            session.chat_id = message.chat_id
+
+        # Download and send the audio file
+        if not session.is_paused:
+            loop = asyncio.get_event_loop()
+            try:
+                filepath = await loop.run_in_executor(None, download_audio_stream, track['url'], user_id)
+                
+                with open(filepath, 'rb') as audio_file:
+                    await context.bot.send_audio(
+                        chat_id=session.chat_id,
+                        audio=audio_file,
+                        title=track['title'],
+                        duration=track.get('duration', 0)
+                    )
+                # Record in history
+                storage_manager.record_play(user_id, {
+                    'title': track['title'],
+                    'url': track['url'],
+                    'duration': track.get('duration', 0)
+                })
+            except Exception as e:
+                logger.error(f"Error downloading/sending audio: {e}")
+                error_text = f"❌ Could not play {track['title']}: {str(e)}"
+                if session.message_id and session.chat_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=session.chat_id,
+                            message_id=session.message_id,
+                            text=error_text,
+                            reply_markup=build_playback_keyboard(session)
+                        )
+                    except telegram.error.BadRequest as e:
+                        if "Message is not modified" not in str(e):
+                            logger.error(f"Error updating error message: {e}")
+                    except Exception as e:
+                        logger.error(f"Error updating error message: {e}")
+            finally:
+                # Clean up the downloaded file
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
+    except Exception as e:
+        logger.error(f"Error in start_next: {e}")
+        error_text = f"❌ Session error: {str(e)}"
+        if session.message_id and session.chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.message_id,
+                    text=error_text,
+                    reply_markup=build_playback_keyboard(session)
+                )
+            except telegram.error.BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    logger.error(f"Error updating error message: {e}")
+            except Exception as e:
+                logger.error(f"Error updating error message: {e}")
+
 async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle callback query for play buttons."""
     query = update.callback_query
-    await query.answer()
-    url = query.data.split("::", 1)[1]
     user_id = query.from_user.id
-    chat_id = query.message.chat_id
+    session = get_session(user_id)
 
-    # Get video info for queue
-    from utils.ytdl_wrapper import get_video_info
+    # Store chat_id if not set
+    if not session.chat_id:
+        session.chat_id = query.message.chat_id
+
+    # Get video info and add to queue
+    url = query.data.split("::", 1)[1]
     loop = asyncio.get_event_loop()
     track_info = await loop.run_in_executor(None, get_video_info, url)
-    # Always enqueue before playing
-    playlist_manager.enqueue(user_id, {
+
+    # Add track to queue before any empty check or message edit
+    was_empty = not session.queue
+    session.add_track({
         'id': track_info.get('id'),
         'title': track_info.get('title'),
         'url': url,
         'duration': track_info.get('duration')
     })
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
-    filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
-    with open(filepath, 'rb') as audio_file:
-        await context.bot.send_audio(
-            chat_id=chat_id,
-            audio=audio_file,
-            title=track_info.get('title', 'Unknown'),
-            duration=track_info.get('duration'),
-            reply_markup=build_now_playing_keyboard(user_id)
-        )
-    storage_manager.record_play(user_id, {
-        'title': track_info.get('title', 'Unknown'),
-        'url': url,
-        'duration': track_info.get('duration', 0)
-    })
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    # Pre-download next song in queue
-    asyncio.create_task(predownload_next(user_id))
+    # If this is the first track, start playing
+    if was_empty or session.current_index == 0:
+        await start_next(context, user_id)
+    else:
+        try:
+            await query.answer(text="✅ Added to queue", show_alert=False)
+        except Exception:
+            pass
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,154 +400,205 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         await update.message.reply_text("Usage: /play <YouTube URL or ID>")
         return
+    
     url = context.args[0]
     user_id = update.effective_user.id
+    session = get_session(user_id)
+    
     if 'playlist?list=' in url or '&list=' in url:
         await update.message.reply_text("Enqueuing playlist, please wait...")
         loop = asyncio.get_event_loop()
         videos = await loop.run_in_executor(None, extract_playlist_videos, url)
+        
         for video in videos:
-            playlist_manager.enqueue(user_id, video)
-        await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+            session.add_track(video)
+        
+        if session.current_index == 0:
+            await start_next(context, user_id)
+        await update.message.reply_text(f"✅ Enqueued {len(videos)} tracks")
         return
-    # Single video: enqueue and play
-    from utils.ytdl_wrapper import get_video_info
+    
+    # Single video
     loop = asyncio.get_event_loop()
     track_info = await loop.run_in_executor(None, get_video_info, url)
-    playlist_manager.enqueue(user_id, {
+    
+    session.add_track({
         'id': track_info.get('id'),
         'title': track_info.get('title'),
         'url': url,
         'duration': track_info.get('duration')
     })
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
-    filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
-    with open(filepath, 'rb') as audio_file:
-        await update.message.reply_audio(
-            audio=audio_file,
-            title=track_info.get('title', 'Unknown'),
-            duration=track_info.get('duration'),
-            reply_markup=build_now_playing_keyboard(user_id)
-        )
-    storage_manager.record_play(user_id, {
-        'title': track_info.get('title', 'Unknown'),
-        'url': url,
-        'duration': track_info.get('duration', 0)
-    })
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    # Pre-download next song in queue
-    asyncio.create_task(predownload_next(user_id))
+    
+    if session.current_index == 0:
+        await start_next(context, user_id)
+    else:
+        await update.message.reply_text("✅ Added to queue")
 
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /next and /queue commands - play next track from queue."""
+    """Handle /next command - play next track from queue."""
     user_id = update.effective_user.id
+    session = get_session(user_id)
     
-    # Get next track from queue
-    next_track = playlist_manager.dequeue(user_id)
-    
-    if next_track is None:
-        await update.message.reply_text("Your queue is empty. Use /search to add something.")
+    if not session.queue:
+        if session.message_id and session.chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.message_id,
+                    text="❌ Queue is empty. Use /search to add more tracks.",
+                    reply_markup=build_playback_keyboard(session)
+                )
+            except Exception as e:
+                logger.error(f"Error updating message: {e}")
+                await update.message.reply_text("❌ Queue is empty. Use /search to add more tracks.")
+        else:
+            await update.message.reply_text("❌ Queue is empty. Use /search to add more tracks.")
         return
     
-    try:
-        # Send upload audio action
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
-        
-        # Download and send next track
-        url = next_track.get('url') or f"https://youtube.com/watch?v={next_track['id']}"
-        loop = asyncio.get_event_loop()
-        filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
-        
-        # Send audio file
-        with open(filepath, 'rb') as audio_file:
-            await update.message.reply_audio(
-                audio=audio_file,
-                title=next_track.get('title', 'Unknown'),
-                duration=next_track.get('duration')
-            )
-            
-            # Record in history
-            storage_manager.record_play(user_id, {
-                'title': next_track.get('title', 'Unknown'),
-                'url': url,
-                'duration': next_track.get('duration', 0)
-            })
-        
-        # Clean up temporary file
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            
-        # Pre-download next song in queue
-        asyncio.create_task(predownload_next(user_id))
-        
-    except Exception as e:
-        logger.error(f"Next command error: {e}")
-        await update.message.reply_text(f"❌ Failed to play next track: {str(e)}")
+    if session.next_track():
+        await start_next(context, user_id)
+    else:
+        if session.message_id and session.chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.message_id,
+                    text="❌ No more tracks in queue. Use /search to add more.",
+                    reply_markup=build_playback_keyboard(session)
+                )
+            except Exception as e:
+                logger.error(f"Error updating message: {e}")
+                await update.message.reply_text("❌ No more tracks in queue. Use /search to add more.")
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /history command - show recent listening history."""
+    """Handle /history command - show recent play history."""
     user_id = update.effective_user.id
-    
-    history = storage_manager.get_history(user_id, limit=10)
+    session = get_session(user_id)
+    history = storage_manager.get_history(user_id)
     
     if not history:
-        await update.message.reply_text("No history yet. Use /play or /search to start listening.")
+        await update.message.reply_text("📜 No recent plays yet. Use /search or /play to start listening.")
         return
     
-    # Build history list
-    history_text = "🎵 **Recent Listening History** 🎵\n\n"
-    
-    for i, entry in enumerate(history, 1):
-        # Format timestamp (truncate to YYYY-MM-DDTHH:MM)
-        timestamp = entry['timestamp'][:16]  # Keep only YYYY-MM-DDTHH:MM
-        title = entry['title']
-        url = entry['url']
+    # Build history message
+    message = "📜 Your Recent Plays:\n\n"
+    for entry in history:
+        # Format timestamp
+        timestamp = datetime.fromisoformat(entry['timestamp'])
+        time_str = timestamp.strftime("%H:%M %Y-%m-%d")
         
-        history_text += f"{i}. [{timestamp}] {title}\n{url}\n\n"
+        # Format duration
+        duration = int(entry.get('duration', 0) or 0)
+        minutes, seconds = divmod(duration, 60)
+        duration_str = f"({minutes:02d}:{seconds:02d})"
+        
+        message += f"▶️ [{time_str}] {entry['title']} {duration_str}\n"
     
-    await update.message.reply_text(history_text, parse_mode='Markdown')
+    # Add current session info if active
+    if session.queue and session.current_index is not None:
+        current = session.get_current_track()
+        if current:
+            message += f"\n🎵 Now Playing: {current['title']}"
+    
+    await update.message.reply_text(message)
 
 
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unrecognized messages."""
-    await update.message.reply_text("Use /search or /play to interact with the bot.")
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+    
+    # Check if user has an active session
+    if session.message_id and session.chat_id:
+        try:
+            # Try to update the existing message
+            await context.bot.edit_message_text(
+                chat_id=session.chat_id,
+                message_id=session.message_id,
+                text="❓ Available commands:\n"
+                     "• /search <keywords> - Find music\n"
+                     "• /play <URL> - Play video/playlist\n"
+                     "• /queue - View queue\n"
+                     "• /history - View history\n\n"
+                     "💡 Tap ▶️ to resume or ⏭️ to play next track",
+                reply_markup=build_playback_keyboard(session)
+            )
+        except Exception as e:
+            logger.error(f"Error updating message: {e}")
+            # If message update fails, send new message
+            await update.message.reply_text(
+                "❓ Available commands:\n"
+                "• /search <keywords> - Find music\n"
+                "• /play <URL> - Play video/playlist\n"
+                "• /queue - View queue\n"
+                "• /history - View history"
+            )
+    else:
+        # No active session, send basic help
+        await update.message.reply_text(
+            "❓ Available commands:\n"
+            "• /search <keywords> - Find music\n"
+            "• /play <URL> - Play video/playlist\n"
+            "• /queue - View queue\n"
+            "• /history - View history"
+        )
 
 
 def cleanup_old_downloads():
-    """Clean up old download files on startup (optional but recommended)."""
-    # TODO: Implement cleanup of files older than 1 hour
+    """Clean up downloads older than 1 hour."""
     downloads_dir = "downloads"
-    if os.path.exists(downloads_dir):
-        logger.info("Download folder exists - consider implementing cleanup logic")
+    if not os.path.exists(downloads_dir):
+        return
+    
+    current_time = datetime.now()
+    for user_dir in os.listdir(downloads_dir):
+        user_path = os.path.join(downloads_dir, user_dir)
+        if not os.path.isdir(user_path):
+            continue
+        
+        for file in os.listdir(user_path):
+            file_path = os.path.join(user_path, file)
+            if not os.path.isfile(file_path):
+                continue
+            
+            file_time = datetime.fromtimestamp(os.path.getctime(file_path))
+            if (current_time - file_time).total_seconds() > 3600:  # 1 hour
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logger.error(f"Error removing old file {file_path}: {e}")
 
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if hasattr(update, 'effective_user') and update.effective_user:
-        user_id = update.effective_user.id
-    else:
-        user_id = update.from_user.id
-    queue = playlist_manager.list_queue(user_id)
-    if not queue:
-        await update.message.reply_text("Your queue is empty. Use /search or /play to add songs.")
+    """Handle /queue command - show current queue."""
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+    
+    if not session.queue:
+        await update.message.reply_text("📋 Queue is empty. Use /search to add tracks.")
         return
-    lines = []
-    keyboard = []
-    for idx, track in enumerate(queue, 1):
-        title = track.get('title', 'Unknown')
+    
+    # Build queue message
+    message = "📋 Current Queue:\n\n"
+    for i, track in enumerate(session.queue):
+        # Format duration as MM:SS
         duration = int(track.get('duration', 0) or 0)
-        mins, secs = divmod(duration, 60)
-        button_text = f"{title[:40]} ({mins:02d}:{secs:02d})"
-        callback_data = f"queue_play::{idx-1}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-        lines.append(f"{idx}. {title} ({mins:02d}:{secs:02d})")
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text("Your queue:", reply_markup=reply_markup)
-    else:
-        await update.edit_message_text("Your queue:", reply_markup=reply_markup)
+        minutes, seconds = divmod(duration, 60)
+        duration_str = f"({minutes:02d}:{seconds:02d})"
+        
+        # Add "Now Playing" indicator
+        if i == session.current_index:
+            message += f"▶️ {track['title']} {duration_str}\n"
+        else:
+            message += f"{i + 1}. {track['title']} {duration_str}\n"
+    
+    # Add queue position info
+    if session.current_index is not None:
+        message += f"\n🎵 Now playing track {session.current_index + 1} of {len(session.queue)}"
+    
+    await update.message.reply_text(message)
 
 
 async def queue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -491,46 +790,34 @@ async def add_to_playlist_inline_callback(update: Update, context: ContextTypes.
     await query.answer("Use /addtoplaylist <playlist_name>.")
 
 def main():
-    """Initialize and run the bot."""
-    # Get bot token from environment
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        raise ValueError("TELEGRAM_TOKEN environment variable is required")
-    
-    # Create downloads directory if it doesn't exist
-    os.makedirs("downloads", exist_ok=True)
-    
-    # Optional: Clean up old files on startup
+    """Start the bot."""
+    # Clean up old downloads on startup
     cleanup_old_downloads()
     
-    # Build application
-    app = ApplicationBuilder().token(token).build()
+    # Create the Application
+    application = ApplicationBuilder().token(os.getenv('TELEGRAM_TOKEN')).build()
     
     # Register command handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("play", play_command))
-    app.add_handler(CommandHandler("next", next_command))
-    app.add_handler(CommandHandler("queue", queue_command))
-    app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("addtoplaylist", add_to_playlist_command))
-    app.add_handler(CommandHandler("myplaylists", my_playlists_command))
-    app.add_handler(CommandHandler("removefrom", remove_from_playlist_command))
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("play", play_command))
+    application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("addtoplaylist", add_to_playlist_command))
+    application.add_handler(CommandHandler("myplaylists", my_playlists_command))
+    application.add_handler(CommandHandler("removefrom", remove_from_playlist_command))
     
-    # Register callback handler for play buttons
-    app.add_handler(CallbackQueryHandler(play_callback, pattern="^play::"))
-    app.add_handler(CallbackQueryHandler(queue_callback, pattern=r"^queue_"))
-    app.add_handler(CallbackQueryHandler(show_playlist_callback, pattern=r"^show_playlist::"))
-    app.add_handler(CallbackQueryHandler(playlist_play_callback, pattern=r"^playlist_play::"))
-    app.add_handler(CallbackQueryHandler(add_to_playlist_inline_callback, pattern=r"^add_to_playlist"))
+    # Register callback handlers
+    application.add_handler(CallbackQueryHandler(play_callback, pattern="^play::"))
+    application.add_handler(CallbackQueryHandler(playback_callback, pattern="^prev$|^pause$|^resume$|^next$|^stop$"))
     
-    # Register fallback handler for unrecognized messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
+    # Register fallback handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
     
-    # Start polling
-    print("Bot is polling...")
-    app.run_polling()
+    # Start the bot
+    application.run_polling()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
