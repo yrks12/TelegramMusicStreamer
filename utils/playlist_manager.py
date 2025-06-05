@@ -122,3 +122,43 @@ class PlaylistManager:
         """
         user_key = str(user_id)
         return self.playlists.get(user_key, [])
+
+    def add_to_named_playlist(self, user_id: int, playlist_name: str, track_info: Dict) -> None:
+        """Add a track to a named playlist for the user."""
+        user_key = str(user_id)
+        if user_key not in self.playlists:
+            self.playlists[user_key] = {}
+        if not isinstance(self.playlists[user_key], dict):
+            # Migrate old queue format to playlists dict
+            self.playlists[user_key] = {"queue": self.playlists[user_key]}
+        if playlist_name not in self.playlists[user_key]:
+            self.playlists[user_key][playlist_name] = []
+        self.playlists[user_key][playlist_name].append(track_info)
+        self._save_playlists()
+
+    def list_named_playlists(self, user_id: int) -> List[str]:
+        """List all playlist names for the user."""
+        user_key = str(user_id)
+        if user_key not in self.playlists or not isinstance(self.playlists[user_key], dict):
+            return []
+        return list(self.playlists[user_key].keys())
+
+    def get_named_playlist(self, user_id: int, playlist_name: str) -> List[Dict]:
+        """Get all tracks in a named playlist for the user."""
+        user_key = str(user_id)
+        if user_key not in self.playlists or not isinstance(self.playlists[user_key], dict):
+            return []
+        return self.playlists[user_key].get(playlist_name, [])
+
+    def remove_from_named_playlist(self, user_id: int, playlist_name: str, index: int) -> bool:
+        """Remove a track by index from a named playlist. Returns True if removed."""
+        user_key = str(user_id)
+        if user_key not in self.playlists or not isinstance(self.playlists[user_key], dict):
+            return False
+        playlist = self.playlists[user_key].get(playlist_name, [])
+        if 0 <= index < len(playlist):
+            del playlist[index]
+            self.playlists[user_key][playlist_name] = playlist
+            self._save_playlists()
+            return True
+        return False

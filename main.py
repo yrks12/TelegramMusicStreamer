@@ -99,9 +99,20 @@ def build_now_playing_keyboard(user_id):
     buttons = []
     if queue:
         buttons.append(InlineKeyboardButton("⏭️ Next", callback_data="queue_next"))
-    # For previous, you could keep a history stack, but for now, just show Next and View Queue
     buttons.append(InlineKeyboardButton("📜 View Queue", callback_data="queue_view"))
+    buttons.append(InlineKeyboardButton("➕ Add to Playlist", callback_data="add_to_playlist"))
     return InlineKeyboardMarkup([buttons])
+
+
+async def predownload_next(user_id):
+    queue = playlist_manager.list_queue(user_id)
+    if queue:
+        next_track = queue[0]
+        url = next_track.get('url')
+        from utils.ytdl_wrapper import download_audio_stream
+        loop = asyncio.get_event_loop()
+        # Only download if not already downloaded
+        await loop.run_in_executor(None, download_audio_stream, url, user_id)
 
 
 async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -141,6 +152,8 @@ async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     })
     if os.path.exists(filepath):
         os.remove(filepath)
+    # Pre-download next song in queue
+    asyncio.create_task(predownload_next(user_id))
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -184,6 +197,8 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     })
     if os.path.exists(filepath):
         os.remove(filepath)
+    # Pre-download next song in queue
+    asyncio.create_task(predownload_next(user_id))
 
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,6 +240,9 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if os.path.exists(filepath):
             os.remove(filepath)
             
+        # Pre-download next song in queue
+        asyncio.create_task(predownload_next(user_id))
+        
     except Exception as e:
         logger.error(f"Next command error: {e}")
         await update.message.reply_text(f"❌ Failed to play next track: {str(e)}")
@@ -328,6 +346,8 @@ async def queue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         })
         if os.path.exists(filepath):
             os.remove(filepath)
+        # Pre-download next song in queue
+        asyncio.create_task(predownload_next(user_id))
         await query.answer("Playing next track.")
     elif data == "queue_view":
         # Show the queue
@@ -360,10 +380,124 @@ async def queue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         })
         if os.path.exists(filepath):
             os.remove(filepath)
+        # Pre-download next song in queue
+        asyncio.create_task(predownload_next(user_id))
         await query.answer(f"Playing: {track_info.get('title', 'Unknown')}")
     else:
         await query.answer("Unknown action.")
 
+
+# --- Playlist Management Commands ---
+
+async def add_to_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Usage: /addtoplaylist <playlist_name>")
+        return
+    playlist_name = context.args[0]
+    history = storage_manager.get_history(user_id, limit=1)
+    if not history:
+        await update.message.reply_text("No recently played song to add.")
+        return
+    track = history[0]
+    playlist_manager.add_to_named_playlist(user_id, playlist_name, track)
+    await update.message.reply_text(f"Added to playlist '{playlist_name}': {track['title']}")
+
+async def my_playlists_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    playlists = playlist_manager.list_named_playlists(user_id)
+    if not playlists:
+        await update.message.reply_text("You have no playlists yet. Use /addtoplaylist <name> to create one.")
+        return
+    keyboard = [[InlineKeyboardButton(name, callback_data=f"show_playlist::{name}")] for name in playlists]
+    await update.message.reply_text("Your playlists:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_playlist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    playlist_name = query.data.split("::", 1)[1]
+    tracks = playlist_manager.get_named_playlist(user_id, playlist_name)
+    if not tracks:
+        await query.answer("Playlist is empty.")
+        return
+    lines = []
+    keyboard = []
+    for idx, track in enumerate(tracks, 1):
+        title = track.get('title', 'Unknown')
+        duration = int(track.get('duration', 0) or 0)
+        mins, secs = divmod(duration, 60)
+        button_text = f"{title[:40]} ({mins:02d}:{secs:02d})"
+        callback_data = f"playlist_play::{playlist_name}::{idx-1}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+        lines.append(f"{idx}. {title} ({mins:02d}:{secs:02d})")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text(f"Playlist: {playlist_name}", reply_markup=reply_markup)
+    await query.answer()
+
+async def playlist_play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    _, playlist_name, idx = query.data.split("::")
+    idx = int(idx)
+    tracks = playlist_manager.get_named_playlist(user_id, playlist_name)
+    if idx < 0 or idx >= len(tracks):
+        await query.answer("Invalid track.")
+        return
+    track = tracks[idx]
+    url = track.get('url')
+    from utils.ytdl_wrapper import get_video_info, download_audio_stream
+    loop = asyncio.get_event_loop()
+    track_info = await loop.run_in_executor(None, get_video_info, url)
+    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_VOICE)
+    filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
+    with open(filepath, 'rb') as audio_file:
+        await context.bot.send_audio(
+            chat_id=query.message.chat_id,
+            audio=audio_file,
+            title=track_info.get('title', 'Unknown'),
+            duration=track_info.get('duration'),
+            reply_markup=build_now_playing_keyboard(user_id)
+        )
+    storage_manager.record_play(user_id, {
+        'title': track_info.get('title', 'Unknown'),
+        'url': url,
+        'duration': track_info.get('duration', 0)
+    })
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    asyncio.create_task(predownload_next(user_id))
+    await query.answer(f"Playing: {track_info.get('title', 'Unknown')}")
+
+async def remove_from_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /removefrom <playlist_name> <index>")
+        return
+    playlist_name = context.args[0]
+    try:
+        idx = int(context.args[1]) - 1
+    except ValueError:
+        await update.message.reply_text("Index must be a number.")
+        return
+    success = playlist_manager.remove_from_named_playlist(user_id, playlist_name, idx)
+    if success:
+        await update.message.reply_text(f"Removed track {idx+1} from playlist '{playlist_name}'.")
+    else:
+        await update.message.reply_text("Failed to remove track. Check playlist name and index.")
+
+# Add inline 'Add to Playlist' button to now-playing messages
+async def add_to_playlist_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    # Get last played song from history
+    history = storage_manager.get_history(user_id, limit=1)
+    if not history:
+        await query.answer("No recently played song to add.")
+        return
+    track = history[0]
+    # Ask user for playlist name
+    await query.message.reply_text("Reply with /addtoplaylist <playlist_name> to add this song to a playlist.")
+    await query.answer("Use /addtoplaylist <playlist_name>.")
 
 def main():
     """Initialize and run the bot."""
@@ -388,10 +522,16 @@ def main():
     app.add_handler(CommandHandler("next", next_command))
     app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("addtoplaylist", add_to_playlist_command))
+    app.add_handler(CommandHandler("myplaylists", my_playlists_command))
+    app.add_handler(CommandHandler("removefrom", remove_from_playlist_command))
     
     # Register callback handler for play buttons
     app.add_handler(CallbackQueryHandler(play_callback, pattern="^play::"))
     app.add_handler(CallbackQueryHandler(queue_callback, pattern=r"^queue_"))
+    app.add_handler(CallbackQueryHandler(show_playlist_callback, pattern=r"^show_playlist::"))
+    app.add_handler(CallbackQueryHandler(playlist_play_callback, pattern=r"^playlist_play::"))
+    app.add_handler(CallbackQueryHandler(add_to_playlist_inline_callback, pattern=r"^add_to_playlist"))
     
     # Register fallback handler for unrecognized messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
