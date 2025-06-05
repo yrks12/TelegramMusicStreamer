@@ -54,11 +54,16 @@ class PlaylistManager:
             track_info: Dictionary with track information (id, title, url, duration)
         """
         user_key = str(user_id)
-        
         if user_key not in self.playlists:
             self.playlists[user_key] = []
-        
-        self.playlists[user_key].append(track_info)
+        # If using new dict format, append to 'queue'
+        if isinstance(self.playlists[user_key], dict):
+            if "queue" not in self.playlists[user_key]:
+                self.playlists[user_key]["queue"] = []
+            self.playlists[user_key]["queue"].append(track_info)
+        # If using old list format, append directly
+        elif isinstance(self.playlists[user_key], list):
+            self.playlists[user_key].append(track_info)
         self._save_playlists()
     
     def dequeue(self, user_id: int) -> Optional[Dict]:
