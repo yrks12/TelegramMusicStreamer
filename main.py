@@ -8,7 +8,7 @@ import asyncio
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaAudio
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -94,54 +94,53 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"❌ Search failed: {str(e)}")
 
 
+def build_now_playing_keyboard(user_id):
+    queue = playlist_manager.list_queue(user_id)
+    buttons = []
+    if queue:
+        buttons.append(InlineKeyboardButton("⏭️ Next", callback_data="queue_next"))
+    # For previous, you could keep a history stack, but for now, just show Next and View Queue
+    buttons.append(InlineKeyboardButton("📜 View Queue", callback_data="queue_view"))
+    return InlineKeyboardMarkup([buttons])
+
+
 async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle callback query for play buttons."""
     query = update.callback_query
-    await query.answer()  # Acknowledge callback to stop loading spinner
-    
-    try:
-        # Extract URL from callback data
-        url = query.data.split("::", 1)[1]
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        # Send upload audio action
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
-        
-        # Download audio in executor
-        loop = asyncio.get_event_loop()
-        filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
-        
-        # Send audio file
-        with open(filepath, 'rb') as audio_file:
-            # Extract track info for history
-            from utils.ytdl_wrapper import get_video_info
-            track_info = await loop.run_in_executor(None, get_video_info, url)
-            
-            await context.bot.send_audio(
-                chat_id=chat_id,
-                audio=audio_file,
-                title=track_info.get('title', 'Unknown'),
-                duration=track_info.get('duration')
-            )
-            
-            # Record in history
-            storage_manager.record_play(user_id, {
-                'title': track_info.get('title', 'Unknown'),
-                'url': url,
-                'duration': track_info.get('duration', 0)
-            })
-        
-        # Clean up temporary file
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            
-    except Exception as e:
-        logger.error(f"Play callback error: {e}")
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"❌ Failed to play: {str(e)}"
+    await query.answer()
+    url = query.data.split("::", 1)[1]
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    # Get video info for queue
+    from utils.ytdl_wrapper import get_video_info
+    loop = asyncio.get_event_loop()
+    track_info = await loop.run_in_executor(None, get_video_info, url)
+    # Always enqueue before playing
+    playlist_manager.enqueue(user_id, {
+        'id': track_info.get('id'),
+        'title': track_info.get('title'),
+        'url': url,
+        'duration': track_info.get('duration')
+    })
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+    filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
+    with open(filepath, 'rb') as audio_file:
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=audio_file,
+            title=track_info.get('title', 'Unknown'),
+            duration=track_info.get('duration'),
+            reply_markup=build_now_playing_keyboard(user_id)
         )
+    storage_manager.record_play(user_id, {
+        'title': track_info.get('title', 'Unknown'),
+        'url': url,
+        'duration': track_info.get('duration', 0)
+    })
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,58 +148,42 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.args:
         await update.message.reply_text("Usage: /play <YouTube URL or ID>")
         return
-    
     url = context.args[0]
     user_id = update.effective_user.id
-    
-    try:
-        # Check if it's a playlist
-        if 'playlist?list=' in url or '&list=' in url:
-            await update.message.reply_text("Enqueuing playlist, please wait...")
-            
-            # Extract playlist videos in executor
-            loop = asyncio.get_event_loop()
-            videos = await loop.run_in_executor(None, extract_playlist_videos, url)
-            
-            # Enqueue all videos
-            for video in videos:
-                playlist_manager.enqueue(user_id, video)
-            
-            await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
-            return
-        
-        # Single video - play immediately
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
-        
+    if 'playlist?list=' in url or '&list=' in url:
+        await update.message.reply_text("Enqueuing playlist, please wait...")
         loop = asyncio.get_event_loop()
-        filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
-        
-        # Send audio file
-        with open(filepath, 'rb') as audio_file:
-            # Get track info
-            from utils.ytdl_wrapper import get_video_info
-            track_info = await loop.run_in_executor(None, get_video_info, url)
-            
-            await update.message.reply_audio(
-                audio=audio_file,
-                title=track_info.get('title', 'Unknown'),
-                duration=track_info.get('duration')
-            )
-            
-            # Record in history
-            storage_manager.record_play(user_id, {
-                'title': track_info.get('title', 'Unknown'),
-                'url': url,
-                'duration': track_info.get('duration', 0)
-            })
-        
-        # Clean up temporary file
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            
-    except Exception as e:
-        logger.error(f"Play command error: {e}")
-        await update.message.reply_text(f"❌ Failed to play: {str(e)}")
+        videos = await loop.run_in_executor(None, extract_playlist_videos, url)
+        for video in videos:
+            playlist_manager.enqueue(user_id, video)
+        await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+        return
+    # Single video: enqueue and play
+    from utils.ytdl_wrapper import get_video_info
+    loop = asyncio.get_event_loop()
+    track_info = await loop.run_in_executor(None, get_video_info, url)
+    playlist_manager.enqueue(user_id, {
+        'id': track_info.get('id'),
+        'title': track_info.get('title'),
+        'url': url,
+        'duration': track_info.get('duration')
+    })
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE)
+    filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
+    with open(filepath, 'rb') as audio_file:
+        await update.message.reply_audio(
+            audio=audio_file,
+            title=track_info.get('title', 'Unknown'),
+            duration=track_info.get('duration'),
+            reply_markup=build_now_playing_keyboard(user_id)
+        )
+    storage_manager.record_play(user_id, {
+        'title': track_info.get('title', 'Unknown'),
+        'url': url,
+        'duration': track_info.get('duration', 0)
+    })
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -284,6 +267,104 @@ def cleanup_old_downloads():
         logger.info("Download folder exists - consider implementing cleanup logic")
 
 
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if hasattr(update, 'effective_user') and update.effective_user:
+        user_id = update.effective_user.id
+    else:
+        user_id = update.from_user.id
+    queue = playlist_manager.list_queue(user_id)
+    if not queue:
+        await update.message.reply_text("Your queue is empty. Use /search or /play to add songs.")
+        return
+    lines = []
+    keyboard = []
+    for idx, track in enumerate(queue, 1):
+        title = track.get('title', 'Unknown')
+        duration = int(track.get('duration', 0) or 0)
+        mins, secs = divmod(duration, 60)
+        button_text = f"{title[:40]} ({mins:02d}:{secs:02d})"
+        callback_data = f"queue_play::{idx-1}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+        lines.append(f"{idx}. {title} ({mins:02d}:{secs:02d})")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text("Your queue:", reply_markup=reply_markup)
+    else:
+        await update.edit_message_text("Your queue:", reply_markup=reply_markup)
+
+
+async def queue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    queue = playlist_manager.list_queue(user_id)
+    if data == "queue_next":
+        # Play next track in queue
+        if not queue:
+            await query.answer("Queue is empty.")
+            return
+        next_track = playlist_manager.dequeue(user_id)
+        if not next_track:
+            await query.answer("Queue is empty.")
+            return
+        url = next_track.get('url')
+        from utils.ytdl_wrapper import get_video_info
+        loop = asyncio.get_event_loop()
+        track_info = await loop.run_in_executor(None, get_video_info, url)
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_VOICE)
+        filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
+        with open(filepath, 'rb') as audio_file:
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=audio_file,
+                title=track_info.get('title', 'Unknown'),
+                duration=track_info.get('duration'),
+                reply_markup=build_now_playing_keyboard(user_id)
+            )
+        storage_manager.record_play(user_id, {
+            'title': track_info.get('title', 'Unknown'),
+            'url': url,
+            'duration': track_info.get('duration', 0)
+        })
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        await query.answer("Playing next track.")
+    elif data == "queue_view":
+        # Show the queue
+        await queue_command(query, context)
+        await query.answer()
+    elif data.startswith("queue_play::"):
+        idx = int(data.split("::")[1])
+        if idx < 0 or idx >= len(queue):
+            await query.answer("Invalid track.")
+            return
+        track = queue[idx]
+        url = track.get('url')
+        from utils.ytdl_wrapper import get_video_info
+        loop = asyncio.get_event_loop()
+        track_info = await loop.run_in_executor(None, get_video_info, url)
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_VOICE)
+        filepath = await loop.run_in_executor(None, download_audio_stream, url, user_id)
+        with open(filepath, 'rb') as audio_file:
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=audio_file,
+                title=track_info.get('title', 'Unknown'),
+                duration=track_info.get('duration'),
+                reply_markup=build_now_playing_keyboard(user_id)
+            )
+        storage_manager.record_play(user_id, {
+            'title': track_info.get('title', 'Unknown'),
+            'url': url,
+            'duration': track_info.get('duration', 0)
+        })
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        await query.answer(f"Playing: {track_info.get('title', 'Unknown')}")
+    else:
+        await query.answer("Unknown action.")
+
+
 def main():
     """Initialize and run the bot."""
     # Get bot token from environment
@@ -305,11 +386,12 @@ def main():
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("play", play_command))
     app.add_handler(CommandHandler("next", next_command))
-    app.add_handler(CommandHandler("queue", next_command))  # Alias for /next
+    app.add_handler(CommandHandler("queue", queue_command))
     app.add_handler(CommandHandler("history", history_command))
     
     # Register callback handler for play buttons
     app.add_handler(CallbackQueryHandler(play_callback, pattern="^play::"))
+    app.add_handler(CallbackQueryHandler(queue_callback, pattern=r"^queue_"))
     
     # Register fallback handler for unrecognized messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
