@@ -62,23 +62,27 @@ class PlaylistManager:
         self._save_playlists()
     
     def dequeue(self, user_id: int) -> Optional[Dict]:
-        """
-        Remove and return the first track from the user's queue.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            Track dictionary or None if queue is empty
-        """
+        """Remove and return the first track from the user's queue."""
         user_key = str(user_id)
-        
-        if user_key not in self.playlists or not self.playlists[user_key]:
+        if user_key not in self.playlists:
             return None
-        
-        track = self.playlists[user_key].pop(0)
-        self._save_playlists()
-        return track
+            
+        # Handle both old list format and new dictionary format
+        if isinstance(self.playlists[user_key], list):
+            if not self.playlists[user_key]:
+                return None
+            track = self.playlists[user_key].pop(0)
+            self._save_playlists()
+            return track
+        elif isinstance(self.playlists[user_key], dict):
+            queue = self.playlists[user_key].get('queue', [])
+            if not queue:
+                return None
+            track = queue.pop(0)
+            self.playlists[user_key]['queue'] = queue
+            self._save_playlists()
+            return track
+        return None
     
     def peek(self, user_id: int) -> Optional[Dict]:
         """
@@ -111,17 +115,17 @@ class PlaylistManager:
             self._save_playlists()
     
     def list_queue(self, user_id: int) -> List[Dict]:
-        """
-        Get the entire queue for a user.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            List of track dictionaries
-        """
+        """Get the user's current queue."""
         user_key = str(user_id)
-        return self.playlists.get(user_key, [])
+        if user_key not in self.playlists:
+            return []
+            
+        # Handle both old list format and new dictionary format
+        if isinstance(self.playlists[user_key], list):
+            return self.playlists[user_key]
+        elif isinstance(self.playlists[user_key], dict):
+            return self.playlists[user_key].get('queue', [])
+        return []
 
     def add_to_named_playlist(self, user_id: int, playlist_name: str, track_info: Dict) -> None:
         """Add a track to a named playlist for the user."""

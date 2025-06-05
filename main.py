@@ -35,20 +35,11 @@ storage_manager = StorageManager()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command - send welcome message with available commands."""
-    welcome_text = """
-🎵 **YouTube Music Bot** 🎵
-
-Welcome! I'm your personal YouTube music assistant. Here are the available commands:
-
-🔍 `/search <keywords>` - Search for music on YouTube
-▶️ `/play <YouTube URL or ID>` - Play a specific track or playlist
-⏭️ `/next` or `/queue` - Play next track from your queue
-📜 `/history` - View your recent listening history
-
-Just send me a command to get started! 🎶
-    """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    """Send a message when the command /start is issued."""
+    await update.message.reply_text(
+        "Welcome to the Music Bot! Use /search to find songs, /play to play them, and /queue to manage your queue. "
+        "You can also manage your playlists with /addtoplaylist, /myplaylists, and /removefrom."
+    )
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
