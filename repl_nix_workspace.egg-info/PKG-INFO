@@ -8,3 +8,4 @@ Requires-Dist: python-telegram-bot==20.8
 Requires-Dist: telegram>=0.0.1
 Requires-Dist: yt-dlp==2025.5.22
 Requires-Dist: mutagen>=1.47.0
+Requires-Dist: requests>=2.31.0

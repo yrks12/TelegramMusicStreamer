@@ -41,6 +41,7 @@ class Session:
         self.chat_id: Optional[int] = None
         self.is_paused: bool = False
         self.current_download_task: Optional[asyncio.Task] = None
+        self.downloading_message_id: Optional[int] = None
 
     def add_track(self, track_info: Dict) -> None:
         """Add a track to the queue."""
@@ -79,6 +80,7 @@ class Session:
         self.message_id = None
         self.chat_id = None
         self.is_paused = False
+        self.downloading_message_id = None
         if self.current_download_task:
             self.current_download_task.cancel()
             self.current_download_task = None
@@ -191,8 +193,18 @@ async def playback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     chat_id=session.chat_id,
                     message_id=session.message_id
                 )
-            except Exception as e:
-                logger.error(f"Error deleting message: {e}")
+            except telegram.error.BadRequest as e:
+                if "Message to delete not found" not in str(e):
+                    logger.error(f"Error deleting message: {e}")
+        if session.downloading_message_id and session.chat_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=session.chat_id,
+                    message_id=session.downloading_message_id
+                )
+            except telegram.error.BadRequest as e:
+                if "Message to delete not found" not in str(e):
+                    logger.error(f"Error deleting downloading message: {e}")
         session.clear()
         user_sessions.pop(user_id, None)
 
@@ -224,10 +236,20 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             minutes, seconds = divmod(duration, 60)
             duration_str = f"({minutes:02d}:{seconds:02d})"
             
-            # Truncate title to 40 characters
-            title = result['title'][:40] + "..." if len(result['title']) > 40 else result['title']
-            button_text = f"{title} {duration_str}"
+            # Format title with uploader
+            title = result['title']
+            uploader = result.get('uploader', 'Unknown Artist')
             
+            # Truncate title and uploader if needed
+            max_title_len = 30
+            max_uploader_len = 20
+            
+            if len(title) > max_title_len:
+                title = title[:max_title_len-3] + "..."
+            if len(uploader) > max_uploader_len:
+                uploader = uploader[:max_uploader_len-3] + "..."
+            
+            button_text = f"{title} {duration_str} - {uploader}"
             callback_data = f"play::{result['webpage_url']}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
         
@@ -271,16 +293,67 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
         return
 
     try:
+        # Format duration as MM:SS
+        duration = track.get('duration', 0)
+        minutes, seconds = divmod(duration, 60)
+        duration_str = f"{minutes:02d}:{seconds:02d}"
+
         # Update the "Now Playing" message
-        message_text = f"🎵 Now Playing: {track['title']}"
+        message_text = (
+            f"🎶 Now Playing:\n"
+            f"{track['title']}\n"
+            f"🧑‍🎤 Author: {track.get('uploader', 'Unknown Artist')}\n"
+            f"⏱️ Duration: {duration_str}"
+        )
+
+        # Send "Downloading..." message
+        if session.chat_id:
+            try:
+                downloading_message = await context.bot.send_message(
+                    chat_id=session.chat_id,
+                    text=f"⏬ Downloading {track['title']}... please wait"
+                )
+                session.downloading_message_id = downloading_message.message_id
+            except Exception as e:
+                logger.error(f"Error sending downloading message: {e}")
+
         if session.message_id and session.chat_id:
             try:
-                await context.bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=session.message_id,
-                    text=message_text,
-                    reply_markup=build_playback_keyboard(session)
-                )
+                # If we have a thumbnail, send it first
+                if track.get('thumbnail'):
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=session.chat_id,
+                            photo=track['thumbnail'],
+                            caption=message_text,
+                            reply_markup=build_playback_keyboard(session)
+                        )
+                        # Delete the old message if it exists
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=session.chat_id,
+                                message_id=session.message_id
+                            )
+                        except telegram.error.BadRequest as e:
+                            if "Message to delete not found" not in str(e):
+                                logger.error(f"Error deleting old message: {e}")
+                    except Exception as e:
+                        logger.error(f"Error sending thumbnail: {e}")
+                        # Fallback to text-only message if thumbnail fails
+                        await context.bot.edit_message_text(
+                            chat_id=session.chat_id,
+                            message_id=session.message_id,
+                            text=message_text,
+                            reply_markup=build_playback_keyboard(session)
+                        )
+                else:
+                    # No thumbnail, just update text
+                    await context.bot.edit_message_text(
+                        chat_id=session.chat_id,
+                        message_id=session.message_id,
+                        text=message_text,
+                        reply_markup=build_playback_keyboard(session)
+                    )
             except telegram.error.BadRequest as e:
                 if "Message is not modified" not in str(e):
                     logger.error(f"Error updating message: {e}")
@@ -296,17 +369,33 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                 return
         else:
             # Create new "Now Playing" message if it doesn't exist
-            message = await context.bot.send_message(
-                chat_id=session.chat_id,
-                text=message_text,
-                reply_markup=build_playback_keyboard(session)
-            )
+            if track.get('thumbnail'):
+                try:
+                    message = await context.bot.send_photo(
+                        chat_id=session.chat_id,
+                        photo=track['thumbnail'],
+                        caption=message_text,
+                        reply_markup=build_playback_keyboard(session)
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending thumbnail: {e}")
+                    # Fallback to text-only message if thumbnail fails
+                    message = await context.bot.send_message(
+                        chat_id=session.chat_id,
+                        text=message_text,
+                        reply_markup=build_playback_keyboard(session)
+                    )
+            else:
+                message = await context.bot.send_message(
+                    chat_id=session.chat_id,
+                    text=message_text,
+                    reply_markup=build_playback_keyboard(session)
+                )
             session.message_id = message.message_id
             session.chat_id = message.chat_id
 
         # Download and send the audio file
         if not session.is_paused:
-            loop = asyncio.get_event_loop()
             try:
                 # Send immediate "uploading" status
                 await context.bot.send_chat_action(
@@ -314,27 +403,90 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                     action=ChatAction.UPLOAD_VOICE
                 )
                 
-                # Start download in background
-                download_task = loop.create_task(
-                    loop.run_in_executor(None, download_audio_stream, track['url'], user_id)
-                )
+                # Download audio
+                result = await download_audio_stream(track['url'], user_id)
+                filepath = result['filepath']
                 
-                # Wait for download to complete
-                filepath = await download_task
+                # Update track info with metadata if not already present
+                if 'uploader' not in track:
+                    track['uploader'] = result['uploader']
+                if 'thumbnail' not in track:
+                    track['thumbnail'] = result['thumbnail']
                 
-                with open(filepath, 'rb') as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=session.chat_id,
-                        audio=audio_file,
-                        title=track['title'],
-                        duration=track.get('duration', 0)
-                    )
+                # Delete the "Downloading..." message if it exists
+                if session.downloading_message_id and session.chat_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=session.chat_id,
+                            message_id=session.downloading_message_id
+                        )
+                    except telegram.error.BadRequest as e:
+                        if "Message to delete not found" not in str(e):
+                            logger.error(f"Error deleting downloading message: {e}")
+                    session.downloading_message_id = None
+                
+                # Download thumbnail if available
+                thumbnail_path = None
+                if track.get('thumbnail'):
+                    try:
+                        import requests
+                        from io import BytesIO
+                        from PIL import Image
+                        
+                        # Create thumbnail directory if it doesn't exist
+                        thumb_dir = os.path.join("downloads", str(user_id), "thumbnails")
+                        os.makedirs(thumb_dir, exist_ok=True)
+                        
+                        # Download and resize thumbnail
+                        response = requests.get(track['thumbnail'])
+                        if response.status_code == 200:
+                            img = Image.open(BytesIO(response.content))
+                            # Resize to a reasonable size (320x180)
+                            img.thumbnail((320, 180))
+                            thumbnail_path = os.path.join(thumb_dir, f"{track['id']}.jpg")
+                            img.save(thumbnail_path, "JPEG")
+                    except Exception as e:
+                        logger.error(f"Error downloading thumbnail: {e}")
+                        thumbnail_path = None
+                
+                # Send audio with thumbnail and caption
+                try:
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        with open(thumbnail_path, 'rb') as thumb_file, open(filepath, 'rb') as audio_file:
+                            await context.bot.send_audio(
+                                chat_id=session.chat_id,
+                                audio=audio_file,
+                                title=track['title'],
+                                duration=track.get('duration', 0),
+                                performer=track.get('uploader', 'Unknown Artist'),
+                                caption=message_text,
+                                thumb=thumb_file
+                            )
+                    else:
+                        # Fallback to audio without thumbnail
+                        with open(filepath, 'rb') as audio_file:
+                            await context.bot.send_audio(
+                                chat_id=session.chat_id,
+                                audio=audio_file,
+                                title=track['title'],
+                                duration=track.get('duration', 0),
+                                performer=track.get('uploader', 'Unknown Artist'),
+                                caption=message_text
+                            )
+                finally:
+                    # Clean up thumbnail file
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        try:
+                            os.remove(thumbnail_path)
+                        except Exception as e:
+                            logger.error(f"Error removing thumbnail file: {e}")
                 
                 # Record in history
                 storage_manager.record_play(user_id, {
                     'title': track['title'],
                     'url': track['url'],
-                    'duration': track.get('duration', 0)
+                    'duration': track.get('duration', 0),
+                    'uploader': track.get('uploader', 'Unknown Artist')
                 })
                 
                 # Clean up the downloaded file
@@ -353,18 +505,23 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                     # Queue is finished
                     if session.message_id and session.chat_id:
                         try:
-                            await context.bot.edit_message_text(
+                            # Try to send a new message instead of editing
+                            await context.bot.send_message(
                                 chat_id=session.chat_id,
-                                message_id=session.message_id,
                                 text="▶️ Queue finished. Use /search or /play to add more.",
                                 reply_markup=build_playback_keyboard(session)
                             )
-                        except telegram.error.BadRequest as e:
-                            if "Message is not modified" not in str(e):
-                                logger.error(f"Error updating queue finished message: {e}")
+                            # Delete the old message
+                            try:
+                                await context.bot.delete_message(
+                                    chat_id=session.chat_id,
+                                    message_id=session.message_id
+                                )
+                            except telegram.error.BadRequest as e:
+                                if "Message to delete not found" not in str(e):
+                                    logger.error(f"Error deleting old message: {e}")
                         except Exception as e:
-                            logger.error(f"Error updating queue finished message: {e}")
-                
+                            logger.error(f"Error sending queue finished message: {e}")
             except Exception as e:
                 logger.error(f"Error downloading/sending audio: {e}")
                 error_text = f"❌ Could not play {track['title']}: {str(e)}"
@@ -399,7 +556,7 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                 logger.error(f"Error updating error message: {e}")
 
 async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button clicks to play a selected track immediately."""
+    """Handle inline button clicks to play or queue a selected track."""
     query = update.callback_query
     await query.answer()
     data = query.data  # format: "play::<url>"
@@ -410,12 +567,43 @@ async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Set chat_id for session if not set
     if not session.chat_id:
         session.chat_id = query.message.chat_id
-    # Add the selected track to the session queue and reset index
-    session.queue = [{"title": "Unknown", "url": url, "duration": None}]
-    session.current_index = 0
-    session.is_paused = False
-    # Start playback using session logic
-    await start_next(context, user_id)
+
+    # Get video info to store metadata
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
+        track_info = {
+            "title": info.get('title', 'Unknown'),
+            "url": url,
+            "duration": info.get('duration', 0),
+            "uploader": info.get('uploader', 'Unknown Artist'),
+            "thumbnail": info.get('thumbnail', '')
+        }
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        track_info = {
+            "title": "Unknown",
+            "url": url,
+            "duration": 0,
+            "uploader": "Unknown Artist",
+            "thumbnail": ""
+        }
+
+    # If queue is empty, add and start playback
+    if not session.queue:
+        session.queue = [track_info]
+        session.current_index = 0
+        session.is_paused = False
+        await start_next(context, user_id)
+    else:
+        # Otherwise, append to queue
+        session.queue.append(track_info)
+        added_msg = await query.message.reply_text(f"✅ Added to queue: {track_info['title']}")
+        # Delete the 'Added to queue' message after 2 seconds
+        await asyncio.sleep(2)
+        try:
+            await context.bot.delete_message(chat_id=added_msg.chat_id, message_id=added_msg.message_id)
+        except Exception:
+            pass
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /play: play single video or enqueue entire playlist."""

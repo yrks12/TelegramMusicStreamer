@@ -12,6 +12,8 @@ This bot acts as your personal YouTube music client, allowing you to search for 
 - Python 3.8 or higher
 - ffmpeg installed on your system
 - A Telegram bot token from [@BotFather](https://t.me/botfather)
+- Pillow (PIL) for image processing
+- requests for thumbnail downloading
 
 ### Installation Steps
 
@@ -52,7 +54,7 @@ This bot acts as your personal YouTube music client, allowing you to search for 
 - **utils/storage.py**: JSON-backed listening history storage and retrieval
 - **data/history.json**: Stores per-user play history (created automatically)
 - **data/playlists.json**: Stores per-user queues (created automatically)
-- **downloads/**: Runtime folder for temporary MP3 files (auto-generated)
+- **downloads/**: Runtime folder for temporary audio and thumbnail files (auto-generated)
 - **requirements.txt**: Pinned dependencies for the project
 - **README.md**: This documentation file
 
@@ -64,7 +66,10 @@ The bot supports the following commands:
 Displays a welcome message with all available commands and their descriptions.
 
 ### `/search <keywords>`
-Search YouTube for music matching your keywords. Returns up to 5 results with an inline keyboard where you can select tracks to play immediately.
+Search YouTube for music matching your keywords. Returns up to 5 results with an inline keyboard where you can select tracks to play immediately. Each result shows:
+- Track title
+- Duration
+- Artist/uploader name
 
 **Example**: `/search bohemian rhapsody queen`
 
@@ -72,6 +77,18 @@ Search YouTube for music matching your keywords. Returns up to 5 results with an
 Play a specific YouTube video or enqueue an entire playlist:
 - For single videos: Downloads and sends the audio immediately
 - For playlists: Adds all tracks to your personal queue for later playback
+
+When a track starts playing, you'll see:
+1. A "Now Playing" message with:
+   - Track thumbnail
+   - Title
+   - Artist/uploader name
+   - Duration
+   - Playback controls (⏮️ Previous, ⏸️ Pause/▶️ Resume, ⏭️ Next, ⏹️ Stop)
+2. The audio message itself, which includes:
+   - The same thumbnail as the track's cover art
+   - A caption with title, artist, and duration
+   - The artist name in the audio metadata
 
 **Examples**: 
 - `/play https://youtube.com/watch?v=fJ9rUzIMcZQ`
@@ -87,10 +104,11 @@ View your last 10 played tracks with timestamps and YouTube links. Perfect for r
 
 ## Technical Details
 
-- **Audio Quality**: All downloads are converted to MP3 at 192kbps for optimal quality/size balance
-- **Storage**: User queues and history are stored in JSON files, with automatic cleanup of temporary audio files
+- **Audio Quality**: All downloads are converted to M4A at 192kbps for optimal quality/size balance
+- **Thumbnails**: Track thumbnails are automatically downloaded, resized to 320x180, and attached to both the "Now Playing" message and the audio message
+- **Storage**: User queues and history are stored in JSON files, with automatic cleanup of temporary audio and thumbnail files
 - **Concurrency**: All YouTube operations use async/await patterns to prevent blocking the bot
-- **Error Handling**: Comprehensive error handling with user-friendly error messages
+- **Error Handling**: Comprehensive error handling with user-friendly error messages and fallbacks if thumbnail processing fails
 
 ## Future Improvements
 
@@ -108,6 +126,8 @@ The project uses these pinned versions for stability:
 - `python-telegram-bot==22.1`
 - `yt-dlp==2025.5.22` 
 - `python-dotenv>=0.21.0`
+- `Pillow>=10.0.0` (for image processing)
+- `requests>=2.31.0` (for thumbnail downloading)
 
 ## Troubleshooting
 
@@ -116,5 +136,6 @@ The project uses these pinned versions for stability:
 2. **"No such file or directory"**: Check that all project files are uploaded correctly
 3. **Bot not responding**: Verify your `TELEGRAM_TOKEN` is set correctly
 4. **Download failures**: Some videos may be restricted - try different content
+5. **Missing thumbnails**: If thumbnail processing fails, the bot will fall back to text-only messages
 
 For any issues, check the console output for detailed error messages.

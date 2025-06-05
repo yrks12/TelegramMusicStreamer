@@ -46,7 +46,8 @@ def search_youtube(query: str, max_results: int = 5) -> List[Dict]:
                         'title': entry.get('title', 'Unknown'),
                         'duration': entry.get('duration', 0),
                         'webpage_url': entry.get('webpage_url', f"https://youtube.com/watch?v={entry.get('id', '')}"),
-                        'thumbnail': entry.get('thumbnail', '')
+                        'thumbnail': entry.get('thumbnail', ''),
+                        'uploader': entry.get('uploader', 'Unknown Artist')
                     })
             
             return results
@@ -83,7 +84,9 @@ def extract_playlist_videos(playlist_url: str) -> List[Dict]:
                         'id': entry.get('id', ''),
                         'title': entry.get('title', 'Unknown'),
                         'url': entry.get('webpage_url', f"https://youtube.com/watch?v={entry.get('id', '')}"),
-                        'duration': entry.get('duration', 0)
+                        'duration': entry.get('duration', 0),
+                        'thumbnail': entry.get('thumbnail', ''),
+                        'uploader': entry.get('uploader', 'Unknown Artist')
                     })
             
             return videos
@@ -97,7 +100,7 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[^\w\-_\. ]', '_', name)
 
 
-async def download_audio_stream(url: str, user_id: int) -> str:
+async def download_audio_stream(url: str, user_id: int) -> Dict:
     """
     Download audio from YouTube video and convert to MP3.
     If already downloaded, reuse the file.
@@ -105,20 +108,32 @@ async def download_audio_stream(url: str, user_id: int) -> str:
         url: YouTube video URL or ID
         user_id: User ID for organizing downloads
     Returns:
-        Absolute path to the downloaded audio file
+        Dictionary containing:
+        - filepath: Absolute path to the downloaded audio file
+        - uploader: Name of the uploader/artist
+        - thumbnail: URL of the video thumbnail
     """
     # Get video info for title
     info = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
     title = info.get('title', 'Unknown')
     video_id = info.get('id', '')
+    uploader = info.get('uploader', 'Unknown Artist')
+    thumbnail = info.get('thumbnail', '')
+    
     # Sanitize title for filename
     safe_title = sanitize_filename(title)
     download_dir = f"downloads/{user_id}"
     os.makedirs(download_dir, exist_ok=True)
     audio_path = os.path.join(download_dir, f"{safe_title}_{video_id}.m4a")
-    # If file exists, return it
+    
+    # If file exists, return it with metadata
     if os.path.exists(audio_path):
-        return os.path.abspath(audio_path)
+        return {
+            'filepath': os.path.abspath(audio_path),
+            'uploader': uploader,
+            'thumbnail': thumbnail
+        }
+    
     # Download to temp file first
     temp_audio_path = os.path.join(download_dir, f"{video_id}.m4a")
     ydl_opts = {
@@ -151,7 +166,12 @@ async def download_audio_stream(url: str, user_id: int) -> str:
                 os.rename(temp_audio_path, audio_path)
             return os.path.abspath(audio_path)
             
-        return await asyncio.get_event_loop().run_in_executor(None, _download)
+        filepath = await asyncio.get_event_loop().run_in_executor(None, _download)
+        return {
+            'filepath': filepath,
+            'uploader': uploader,
+            'thumbnail': thumbnail
+        }
     except Exception as e:
         raise Exception(f"Audio download failed: {str(e)}")
 
@@ -180,7 +200,8 @@ def get_video_info(url: str) -> Dict:
                 'title': info.get('title', 'Unknown'),
                 'duration': info.get('duration', 0),
                 'webpage_url': info.get('webpage_url', url),
-                'thumbnail': info.get('thumbnail', '')
+                'thumbnail': info.get('thumbnail', ''),
+                'uploader': info.get('uploader', 'Unknown Artist')
             }
             
     except Exception as e:
