@@ -6,6 +6,9 @@ Handles searching, playlist extraction, and audio downloading.
 import os
 import yt_dlp
 from typing import List, Dict, Optional
+import re
+from mutagen.easyid3 import EasyID3
+from mutagen.mp3 import MP3
 
 # TODO: Add unit tests
 
@@ -88,22 +91,35 @@ def extract_playlist_videos(playlist_url: str) -> List[Dict]:
         raise Exception(f"Playlist extraction failed: {str(e)}")
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize string for safe filenames."""
+    return re.sub(r'[^\w\-_\. ]', '_', name)
+
+
 def download_audio_stream(url: str, user_id: int) -> str:
     """
     Download audio from YouTube video and convert to MP3.
-    
+    If already downloaded, reuse the file.
     Args:
         url: YouTube video URL or ID
         user_id: User ID for organizing downloads
-        
     Returns:
         Absolute path to the downloaded MP3 file
     """
-    # Create user-specific download directory
+    # Get video info for title
+    info = get_video_info(url)
+    title = info.get('title', 'Unknown')
+    video_id = info.get('id', '')
+    # Sanitize title for filename
+    safe_title = sanitize_filename(title)
     download_dir = f"downloads/{user_id}"
     os.makedirs(download_dir, exist_ok=True)
-    
-    # Configure yt-dlp options for audio download
+    mp3_path = os.path.join(download_dir, f"{safe_title}_{video_id}.mp3")
+    # If file exists, return it
+    if os.path.exists(mp3_path):
+        return os.path.abspath(mp3_path)
+    # Download to temp file first
+    temp_mp3_path = os.path.join(download_dir, f"{video_id}.mp3")
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(download_dir, '%(id)s.%(ext)s'),
@@ -115,20 +131,17 @@ def download_audio_stream(url: str, user_id: int) -> str:
         'quiet': True,
         'no_warnings': True,
     }
-    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info to get the video ID
-            info = ydl.extract_info(url, download=False)
-            video_id = info.get('id', '')
-            
-            # Download and convert
             ydl.download([url])
-            
-            # Return the MP3 file path
-            mp3_path = os.path.join(download_dir, f"{video_id}.mp3")
-            return os.path.abspath(mp3_path)
-            
+        # Rename to include title
+        if os.path.exists(temp_mp3_path):
+            os.rename(temp_mp3_path, mp3_path)
+        # Add ID3 tags
+        audio = MP3(mp3_path, ID3=EasyID3)
+        audio['title'] = title
+        audio.save()
+        return os.path.abspath(mp3_path)
     except Exception as e:
         raise Exception(f"Audio download failed: {str(e)}")
 

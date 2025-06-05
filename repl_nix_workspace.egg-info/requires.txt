@@ -1,0 +1,5 @@
+python-dotenv>=0.21.0
+python-telegram-bot==20.8
+telegram>=0.0.1
+yt-dlp==2025.5.22
+mutagen>=1.47.0

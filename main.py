@@ -75,7 +75,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = []
         for result in results:
             # Format duration as MM:SS
-            duration = result.get('duration', 0)
+            duration = int(result.get('duration', 0) or 0)
             minutes, seconds = divmod(duration, 60)
             duration_str = f"({minutes:02d}:{seconds:02d})"
             

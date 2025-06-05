@@ -5,7 +5,6 @@ channel = "stable-24_05"
 packages = ["ffmpeg"]
 
 [workflows]
-runButton = "Project"
 
 [[workflows.workflow]]
 name = "Project"
