@@ -406,27 +406,16 @@ async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     _, url = data.split("::", 1)
     user_id = query.from_user.id
 
-    await query.message.chat.send_action(action=ChatAction.UPLOAD_VOICE)
-
-    try:
-        audio_path = await download_audio_stream(url, user_id)
-        title = os.path.basename(audio_path).rsplit(".", 1)[0]
-
-        with open(audio_path, "rb") as audio_file:
-            await context.bot.send_audio(
-                chat_id=query.message.chat_id,
-                audio=audio_file,
-                title=title,
-            )
-
-        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
-        os.remove(audio_path)
-
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"❌ Failed to download/play: {e}",
-        )
+    session = get_session(user_id)
+    # Set chat_id for session if not set
+    if not session.chat_id:
+        session.chat_id = query.message.chat_id
+    # Add the selected track to the session queue and reset index
+    session.queue = [{"title": "Unknown", "url": url, "duration": None}]
+    session.current_index = 0
+    session.is_paused = False
+    # Start playback using session logic
+    await start_next(context, user_id)
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /play: play single video or enqueue entire playlist."""
@@ -436,6 +425,8 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     url = context.args[0]
     user_id = update.message.from_user.id
+    session = get_session(user_id)
+    session.chat_id = update.message.chat_id
 
     # Detect playlist URL
     if "playlist?list=" in url or "&list=" in url:
@@ -444,27 +435,20 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             videos = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: extract_playlist_videos(url)
             )
-            for vid in videos:
-                playlist_manager.enqueue(user_id, vid)
+            session.queue = videos
+            session.current_index = 0
+            session.is_paused = False
             await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+            await start_next(context, user_id)
         except Exception as e:
             await update.message.reply_text(f"❌ Error extracting playlist: {e}")
         return
 
     # Otherwise, play single video
-    await update.message.chat.send_action(action=ChatAction.UPLOAD_VOICE)
-    try:
-        audio_path = await download_audio_stream(url, user_id)
-        title = os.path.basename(audio_path).rsplit(".", 1)[0]
-
-        with open(audio_path, "rb") as audio_file:
-            await update.message.reply_audio(audio=audio_file, title=title)
-
-        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
-        os.remove(audio_path)
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Could not download/play audio: {e}")
+    session.queue = [{"title": "Unknown", "url": url, "duration": None}]
+    session.current_index = 0
+    session.is_paused = False
+    await start_next(context, user_id)
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /next or /queue: play the next track in the user's queue."""
