@@ -308,7 +308,19 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
         if not session.is_paused:
             loop = asyncio.get_event_loop()
             try:
-                filepath = await loop.run_in_executor(None, download_audio_stream, track['url'], user_id)
+                # Send immediate "uploading" status
+                await context.bot.send_chat_action(
+                    chat_id=session.chat_id,
+                    action=ChatAction.UPLOAD_VOICE
+                )
+                
+                # Start download in background
+                download_task = loop.create_task(
+                    loop.run_in_executor(None, download_audio_stream, track['url'], user_id)
+                )
+                
+                # Wait for download to complete
+                filepath = await download_task
                 
                 with open(filepath, 'rb') as audio_file:
                     await context.bot.send_audio(
@@ -317,12 +329,42 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                         title=track['title'],
                         duration=track.get('duration', 0)
                     )
+                
                 # Record in history
                 storage_manager.record_play(user_id, {
                     'title': track['title'],
                     'url': track['url'],
                     'duration': track.get('duration', 0)
                 })
+                
+                # Clean up the downloaded file
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                
+                # Check if there's a next track
+                if session.current_index + 1 < len(session.queue):
+                    # Auto-advance to next track
+                    session.current_index += 1
+                    # Small delay to prevent rapid-fire downloads
+                    await asyncio.sleep(1)
+                    # Start next track
+                    await start_next(context, user_id)
+                else:
+                    # Queue is finished
+                    if session.message_id and session.chat_id:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=session.chat_id,
+                                message_id=session.message_id,
+                                text="▶️ Queue finished. Use /search or /play to add more.",
+                                reply_markup=build_playback_keyboard(session)
+                            )
+                        except telegram.error.BadRequest as e:
+                            if "Message is not modified" not in str(e):
+                                logger.error(f"Error updating queue finished message: {e}")
+                        except Exception as e:
+                            logger.error(f"Error updating queue finished message: {e}")
+                
             except Exception as e:
                 logger.error(f"Error downloading/sending audio: {e}")
                 error_text = f"❌ Could not play {track['title']}: {str(e)}"
@@ -339,11 +381,6 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                             logger.error(f"Error updating error message: {e}")
                     except Exception as e:
                         logger.error(f"Error updating error message: {e}")
-            finally:
-                # Clean up the downloaded file
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-
     except Exception as e:
         logger.error(f"Error in start_next: {e}")
         error_text = f"❌ Session error: {str(e)}"
@@ -362,115 +399,96 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                 logger.error(f"Error updating error message: {e}")
 
 async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback query for play buttons."""
+    """Handle inline button clicks to play a selected track immediately."""
     query = update.callback_query
+    await query.answer()
+    data = query.data  # format: "play::<url>"
+    _, url = data.split("::", 1)
     user_id = query.from_user.id
-    session = get_session(user_id)
 
-    # Store chat_id if not set
-    if not session.chat_id:
-        session.chat_id = query.message.chat_id
+    await query.message.chat.send_action(action=ChatAction.UPLOAD_VOICE)
 
-    # Get video info and add to queue
-    url = query.data.split("::", 1)[1]
-    loop = asyncio.get_event_loop()
-    track_info = await loop.run_in_executor(None, get_video_info, url)
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        title = os.path.basename(audio_path).rsplit(".", 1)[0]
 
-    # Add track to queue before any empty check or message edit
-    was_empty = not session.queue
-    session.add_track({
-        'id': track_info.get('id'),
-        'title': track_info.get('title'),
-        'url': url,
-        'duration': track_info.get('duration')
-    })
+        with open(audio_path, "rb") as audio_file:
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=audio_file,
+                title=title,
+            )
 
-    # If this is the first track, start playing
-    if was_empty or session.current_index == 0:
-        await start_next(context, user_id)
-    else:
-        try:
-            await query.answer(text="✅ Added to queue", show_alert=False)
-        except Exception:
-            pass
+        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
+        os.remove(audio_path)
 
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Failed to download/play: {e}",
+        )
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /play command - play single video or enqueue playlist."""
+    """Handle /play: play single video or enqueue entire playlist."""
     if not context.args:
         await update.message.reply_text("Usage: /play <YouTube URL or ID>")
         return
-    
-    url = context.args[0]
-    user_id = update.effective_user.id
-    session = get_session(user_id)
-    
-    if 'playlist?list=' in url or '&list=' in url:
-        await update.message.reply_text("Enqueuing playlist, please wait...")
-        loop = asyncio.get_event_loop()
-        videos = await loop.run_in_executor(None, extract_playlist_videos, url)
-        
-        for video in videos:
-            session.add_track(video)
-        
-        if session.current_index == 0:
-            await start_next(context, user_id)
-        await update.message.reply_text(f"✅ Enqueued {len(videos)} tracks")
-        return
-    
-    # Single video
-    loop = asyncio.get_event_loop()
-    track_info = await loop.run_in_executor(None, get_video_info, url)
-    
-    session.add_track({
-        'id': track_info.get('id'),
-        'title': track_info.get('title'),
-        'url': url,
-        'duration': track_info.get('duration')
-    })
-    
-    if session.current_index == 0:
-        await start_next(context, user_id)
-    else:
-        await update.message.reply_text("✅ Added to queue")
 
+    url = context.args[0]
+    user_id = update.message.from_user.id
+
+    # Detect playlist URL
+    if "playlist?list=" in url or "&list=" in url:
+        await update.message.reply_text("Enqueuing playlist, please wait...")
+        try:
+            videos = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: extract_playlist_videos(url)
+            )
+            for vid in videos:
+                playlist_manager.enqueue(user_id, vid)
+            await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error extracting playlist: {e}")
+        return
+
+    # Otherwise, play single video
+    await update.message.chat.send_action(action=ChatAction.UPLOAD_VOICE)
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        title = os.path.basename(audio_path).rsplit(".", 1)[0]
+
+        with open(audio_path, "rb") as audio_file:
+            await update.message.reply_audio(audio=audio_file, title=title)
+
+        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
+        os.remove(audio_path)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not download/play audio: {e}")
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /next command - play next track from queue."""
-    user_id = update.effective_user.id
-    session = get_session(user_id)
-    
-    if not session.queue:
-        if session.message_id and session.chat_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=session.message_id,
-                    text="❌ Queue is empty. Use /search to add more tracks.",
-                    reply_markup=build_playback_keyboard(session)
-                )
-            except Exception as e:
-                logger.error(f"Error updating message: {e}")
-                await update.message.reply_text("❌ Queue is empty. Use /search to add more tracks.")
-        else:
-            await update.message.reply_text("❌ Queue is empty. Use /search to add more tracks.")
-        return
-    
-    if session.next_track():
-        await start_next(context, user_id)
-    else:
-        if session.message_id and session.chat_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=session.message_id,
-                    text="❌ No more tracks in queue. Use /search to add more.",
-                    reply_markup=build_playback_keyboard(session)
-                )
-            except Exception as e:
-                logger.error(f"Error updating message: {e}")
-                await update.message.reply_text("❌ No more tracks in queue. Use /search to add more.")
+    """Handle /next or /queue: play the next track in the user's queue."""
+    user_id = update.message.from_user.id
+    next_track = playlist_manager.dequeue(user_id)
 
+    if not next_track:
+        await update.message.reply_text("Your queue is empty. Use /search to add something.")
+        return
+
+    url = next_track["url"]
+    title = next_track.get("title", "Unknown Title")
+    await update.message.chat.send_action(action=ChatAction.UPLOAD_VOICE)
+
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        with open(audio_path, "rb") as audio_file:
+            await update.message.reply_audio(audio=audio_file, title=title)
+
+        storage_manager.record_play(user_id, next_track)
+        os.remove(audio_path)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error playing next track: {e}")
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /history command - show recent play history."""

@@ -9,6 +9,7 @@ from typing import List, Dict, Optional
 import re
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
+import asyncio
 
 # TODO: Add unit tests
 
@@ -96,7 +97,7 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[^\w\-_\. ]', '_', name)
 
 
-def download_audio_stream(url: str, user_id: int) -> str:
+async def download_audio_stream(url: str, user_id: int) -> str:
     """
     Download audio from YouTube video and convert to MP3.
     If already downloaded, reuse the file.
@@ -104,44 +105,53 @@ def download_audio_stream(url: str, user_id: int) -> str:
         url: YouTube video URL or ID
         user_id: User ID for organizing downloads
     Returns:
-        Absolute path to the downloaded MP3 file
+        Absolute path to the downloaded audio file
     """
     # Get video info for title
-    info = get_video_info(url)
+    info = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
     title = info.get('title', 'Unknown')
     video_id = info.get('id', '')
     # Sanitize title for filename
     safe_title = sanitize_filename(title)
     download_dir = f"downloads/{user_id}"
     os.makedirs(download_dir, exist_ok=True)
-    mp3_path = os.path.join(download_dir, f"{safe_title}_{video_id}.mp3")
+    audio_path = os.path.join(download_dir, f"{safe_title}_{video_id}.m4a")
     # If file exists, return it
-    if os.path.exists(mp3_path):
-        return os.path.abspath(mp3_path)
+    if os.path.exists(audio_path):
+        return os.path.abspath(audio_path)
     # Download to temp file first
-    temp_mp3_path = os.path.join(download_dir, f"{video_id}.mp3")
+    temp_audio_path = os.path.join(download_dir, f"{video_id}.m4a")
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio/best',  # More flexible format selection
         'outtmpl': os.path.join(download_dir, '%(id)s.%(ext)s'),
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
         'quiet': True,
         'no_warnings': True,
+        'nocheckcertificate': True,
+        'ignoreerrors': False,
+        'retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
+        'keepvideo': False,
+        'writethumbnail': False,
+        'noplaylist': True,
+        'extract_flat': False,
+        'concurrent_fragments': 4,  # Parallel fragment downloads
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'm4a',
+            'preferredquality': '192',
+        }],
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        # Rename to include title
-        if os.path.exists(temp_mp3_path):
-            os.rename(temp_mp3_path, mp3_path)
-        # Add ID3 tags
-        audio = MP3(mp3_path, ID3=EasyID3)
-        audio['title'] = title
-        audio.save()
-        return os.path.abspath(mp3_path)
+        def _download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            # Rename to include title
+            if os.path.exists(temp_audio_path):
+                os.rename(temp_audio_path, audio_path)
+            return os.path.abspath(audio_path)
+            
+        return await asyncio.get_event_loop().run_in_executor(None, _download)
     except Exception as e:
         raise Exception(f"Audio download failed: {str(e)}")
 
