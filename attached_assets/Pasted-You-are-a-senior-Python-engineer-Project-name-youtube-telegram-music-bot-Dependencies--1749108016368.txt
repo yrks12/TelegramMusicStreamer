@@ -1,0 +1,571 @@
+You are a senior Python engineer.
+
+**Project name:** youtube-telegram-music-bot  
+**Dependencies:**  
+- python-telegram-bot==22.1  
+- yt-dlp==2025.5.22  
+- ffmpeg (system‐level for audio extraction)  
+**Python version:** 3.8+
+
+### Requirements
+1. **Create the file tree:**
+   - main.py
+   - utils/
+       - __init__.py
+       - ytdl_wrapper.py
+       - playlist_manager.py
+       - storage.py
+   - data/
+       - history.json
+       - playlists.json
+   - downloads/         # created at runtime for temporary files
+   - requirements.txt
+   - README.md
+
+2. **Environment & Setup:**
+   - All sensitive values (TELEGRAM_TOKEN) must be read from environment variables (e.g., via python-dotenv or Replit Secrets).
+   - Ensure ffmpeg is installed in the environment so yt-dlp can perform audio extraction (`apt-get install -y ffmpeg` or equivalent).
+   - Pin exact dependency versions in `requirements.txt`:
+     ```
+     python-telegram-bot==22.1
+     yt-dlp==2025.5.22
+     python-dotenv>=0.21.0
+     ```
+   - Follow PEP 8 style, type-hint everything, include brief docstrings and “TODO” comments for later unit testing.
+
+3. **main.py: Bot Initialization & Handlers**
+   - Load environment variables at startup (`from dotenv import load_dotenv; load_dotenv()`).
+   - Initialize a `telegram.ext.Application` with `ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()`.
+   - Register these command handlers and a callback handler:
+     1. **/start**  
+        - Send a welcome message explaining all available commands:  
+          ```
+          👋 Welcome to YouTube Music Bot!
+          Commands:
+            • /search <keywords>
+            • /play <YouTube URL or ID>
+            • /next or /queue
+            • /history
+          ```
+     2. **/search <keywords>**  
+        - Validate `context.args`; reply “Usage: /search <keywords>” if empty.  
+        - Indicate “typing” with `ChatAction.TYPING`.  
+        - Call `search_youtube(query, max_results=5)` from `utils/ytdl_wrapper.py` inside `asyncio.get_event_loop().run_in_executor(...)`.  
+        - If no results, reply “No results found.”  
+        - Build an `InlineKeyboardMarkup` with one row per result:  
+          - Button text: `"{title_truncated} (mm:ss)"`  
+          - Callback data: `"play::<webpage_url>"`  
+        - Reply with “Select a track to play or queue:” and the inline keyboard.
+
+     3. **CallbackQueryHandler** (pattern `^play::`)  
+        - When user taps a search result, extract `url` from `callback_data.split("::", 1)`.  
+        - Acknowledge with `query.answer()`.  
+        - Set chat action `ChatAction.UPLOAD_AUDIO`.  
+        - Call `download_audio_stream(url, user_id)` from `utils/ytdl_wrapper.py` inside `await asyncio.get_event_loop().run_in_executor(...)`.  
+        - After download, send resulting MP3 file with `send_audio(chat_id, audio=file_handle, title=title)`.  
+        - Record the play in history via `storage_manager.record_play(user_id, { "title": title, "url": url, "duration": duration })`.  
+        - Delete the temp file after sending.  
+        - Wrap each step in `try/except Exception as e` to reply “❌ Failed to play: {e}”.
+
+     4. **/play <YouTube URL or ID>**  
+        - Validate `context.args`; if empty, reply “Usage: /play <YouTube URL or ID>”.  
+        - Determine if argument contains `playlist?list=` or `&list=`.  
+          - If a playlist URL is detected:  
+            - Call `extract_playlist_videos(playlist_url)` (a function in `utils/ytdl_wrapper.py` that runs a flat-playlist extraction).  
+            - For each video dict returned (`{ "id", "title", "url", "duration" }`), call `playlist_manager.enqueue(user_id, track_info)`.  
+            - Reply “Enqueued {n} tracks from the playlist.”  
+            - Return early (do not play immediately).  
+          - Otherwise (single video):  
+            - Indicate `ChatAction.UPLOAD_AUDIO`.  
+            - Call `download_audio_stream(url, user_id)` in executor.  
+            - Send the MP3 via `reply_audio(audio=file_handle, title=title)`.  
+            - Record history (same as callback).  
+            - Delete temp file.  
+            - Catch exceptions and reply with an error message.
+
+     5. **/next** or **/queue**  
+        - Call `playlist_manager.dequeue(user_id)`.  
+        - If `None`, reply “Your queue is empty. Use /search to add something.”  
+        - Otherwise:  
+          - Extract `{ "url", "title", "duration" }`.  
+          - Indicate `ChatAction.UPLOAD_AUDIO`.  
+          - Download via `download_audio_stream(url, user_id)` in executor.  
+          - Send the MP3.  
+          - Record in history.  
+          - Delete the temp file.  
+          - Handle exceptions: reply “❌ Error playing next track: {e}”.
+
+     6. **/history**  
+        - Call `storage_manager.get_history(user_id, limit=10)`.  
+        - If empty, reply “No history yet. Use /search or /play to start listening.”  
+        - Otherwise, build a numbered list of the last plays:  
+          ```
+          🎧 Your last plays:
+          1. [2025-06-05T12:34] Title – https://youtu.be/xxxx
+          2. [2025-06-04T09:12] Title – https://youtu.be/yyyy
+          ...
+          ```
+        - Reply with that text.
+
+     7. **Fallback MessageHandler**  
+        - For any text not matching commands, reply “Use /search or /play to interact with the bot.”
+
+     8. **Application run**  
+        - At end of `main()`, call `app.run_polling()` and print “Bot is polling…” to console.
+
+4. **utils/ytdl_wrapper.py**  
+   ```python
+   import os
+   import yt_dlp
+
+   YTDL_OPTS_AUDIO_BASE = {
+       "format": "bestaudio/best",
+       "outtmpl": None,  # set per-user in download function
+       "restrictfilenames": True,
+       "nocheckcertificate": True,
+       "ignoreerrors": False,
+       "quiet": True,
+       "no_warnings": True,
+       "postprocessors": [
+           {
+               "key": "FFmpegExtractAudio",
+               "preferredcodec": "mp3",
+               "preferredquality": "192",
+           }
+       ],
+   }
+
+   def search_youtube(query: str, max_results: int = 5) -> list[dict]:
+       """
+       Uses yt-dlp’s 'ytsearch' feature to fetch top results.
+       Returns a list of dicts with keys: id, title, duration, webpage_url, thumbnail.
+       """
+       ydl_opts = {
+           "quiet": True,
+           "skip_download": True,
+           "extract_flat": True,
+           "dump_single_json": True,
+           "default_search": f"ytsearch{max_results}",
+       }
+       with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+           info = ydl.extract_info(query, download=False)
+           results = []
+           for entry in info.get("entries", []):
+               results.append({
+                   "id": entry["id"],
+                   "title": entry.get("title"),
+                   "duration": entry.get("duration"),
+                   "webpage_url": entry.get("webpage_url"),
+                   "thumbnail": entry.get("thumbnail"),
+               })
+           return results
+
+   def extract_playlist_videos(playlist_url: str) -> list[dict]:
+       """
+       Returns a list of video dicts (id, title, url, duration) for all entries in the playlist.
+       """
+       ydl_opts = {
+           "quiet": True,
+           "skip_download": True,
+           "extract_flat": True,
+           "dump_single_json": True,
+       }
+       with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+           info = ydl.extract_info(playlist_url, download=False)
+           videos = []
+           for entry in info.get("entries", []):
+               videos.append({
+                   "id": entry["id"],
+                   "title": entry.get("title"),
+                   "url": entry.get("url"),  # either full URL or id to reconstruct
+                   "duration": entry.get("duration"),
+               })
+           return videos
+
+   async def download_audio_stream(url: str, user_id: int) -> str:
+       """
+       Downloads the audio from the given URL, saves to downloads/<user_id>/, and returns the local .mp3 filepath.
+       Must be called inside asyncio.get_event_loop().run_in_executor(...) to avoid blocking.
+       """
+       base_folder = os.path.join("downloads", str(user_id))
+       os.makedirs(base_folder, exist_ok=True)
+       opts = YTDL_OPTS_AUDIO_BASE.copy()
+       opts["outtmpl"] = os.path.join(base_folder, "%(id)s.%(ext)s")
+       def _run_download():
+           with yt_dlp.YoutubeDL(opts) as ydl:
+               info = ydl.extract_info(url, download=True)
+               filename = ydl.prepare_filename(info)
+               return os.path.splitext(filename)[0] + ".mp3"
+       loop = __import__("asyncio").get_event_loop()
+       filepath = await loop.run_in_executor(None, _run_download)
+       return filepath
+
+	5.	utils/playlist_manager.py
+
+import json
+from pathlib import Path
+
+PLAYLISTS_FILE = Path("data/playlists.json")
+
+class PlaylistManager:
+    """
+    JSON-backed per-user queues. Structure:
+    { "<user_id>": [ { "id", "title", "url", "duration" }, ... ], ... }
+    """
+
+    def __init__(self):
+        PLAYLISTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not PLAYLISTS_FILE.exists():
+            PLAYLISTS_FILE.write_text(json.dumps({}))
+        with open(PLAYLISTS_FILE, "r") as f:
+            self.all_queues = json.load(f)
+
+    def _save(self):
+        with open(PLAYLISTS_FILE, "w") as f:
+            json.dump(self.all_queues, f, indent=2)
+
+    def enqueue(self, user_id: int, track_info: dict) -> None:
+        uid = str(user_id)
+        queue = self.all_queues.get(uid, [])
+        queue.append(track_info)
+        self.all_queues[uid] = queue
+        self._save()
+
+    def dequeue(self, user_id: int) -> dict | None:
+        uid = str(user_id)
+        queue = self.all_queues.get(uid, [])
+        if not queue:
+            return None
+        next_track = queue.pop(0)
+        self.all_queues[uid] = queue
+        self._save()
+        return next_track
+
+    def peek(self, user_id: int) -> dict | None:
+        uid = str(user_id)
+        queue = self.all_queues.get(uid, [])
+        return queue[0] if queue else None
+
+    def clear(self, user_id: int) -> None:
+        self.all_queues[str(user_id)] = []
+        self._save()
+
+    def list_queue(self, user_id: int) -> list[dict]:
+        return self.all_queues.get(str(user_id), [])
+
+
+	6.	utils/storage.py
+
+import json
+from pathlib import Path
+from datetime import datetime
+
+HISTORY_FILE = Path("data/history.json")
+
+class StorageManager:
+    """
+    Maintains per-user listening history:
+    { "<user_id>": [ { "timestamp", "title", "url", "duration" }, ... ], ... }
+    """
+
+    def __init__(self):
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not HISTORY_FILE.exists():
+            HISTORY_FILE.write_text(json.dumps({}))
+        with open(HISTORY_FILE, "r") as f:
+            self.data = json.load(f)
+
+    def _save(self):
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def record_play(self, user_id: int, track_info: dict) -> None:
+        uid = str(user_id)
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "title": track_info.get("title"),
+            "url": track_info.get("url"),
+            "duration": track_info.get("duration"),
+        }
+        self.data.setdefault(uid, []).append(entry)
+        # Keep only the last 100 entries
+        if len(self.data[uid]) > 100:
+            self.data[uid] = self.data[uid][-100:]
+        self._save()
+
+    def get_history(self, user_id: int, limit: int = 10) -> list[dict]:
+        uid = str(user_id)
+        return self.data.get(uid, [])[-limit:]
+
+
+	7.	main.py
+
+import os
+import asyncio
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatAction,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from utils.ytdl_wrapper import search_youtube, extract_playlist_videos, download_audio_stream
+from utils.playlist_manager import PlaylistManager
+from utils.storage import StorageManager
+
+load_dotenv()
+
+playlist_manager = PlaylistManager()
+storage_manager = StorageManager()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start: send welcome message and instructions."""
+    text = (
+        "👋 Welcome to YouTube Music Bot!\n\n"
+        "Commands:\n"
+        "  • /search <keywords>\n"
+        "  • /play <YouTube URL or ID>\n"
+        "  • /next or /queue\n"
+        "  • /history\n"
+    )
+    await update.message.reply_text(text)
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /search: query YouTube and show top-5 results as inline buttons."""
+    if not context.args:
+        await update.message.reply_text("Usage: /search <keywords>")
+        return
+
+    query = " ".join(context.args)
+    await update.message.chat.send_action(action=ChatAction.TYPING)
+
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: search_youtube(query, max_results=5)
+        )
+        if not results:
+            await update.message.reply_text("No results found.")
+            return
+
+        keyboard = []
+        for entry in results:
+            title = entry["title"] or "Unknown Title"
+            duration = entry.get("duration") or 0
+            mins, secs = divmod(duration, 60)
+            button_text = f"{title[:40]} ({mins:02d}:{secs:02d})"
+            callback_data = f"play::{entry['webpage_url']}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Select a track to play or queue:", reply_markup=reply_markup)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error during search: {e}")
+
+async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button clicks to play a selected track immediately."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # format: "play::<url>"
+    _, url = data.split("::", 1)
+    user_id = query.from_user.id
+
+    await query.message.chat.send_action(action=ChatAction.UPLOAD_AUDIO)
+
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        title = os.path.basename(audio_path).rsplit(".", 1)[0]
+
+        with open(audio_path, "rb") as audio_file:
+            await context.bot.send_audio(
+                chat_id=query.message.chat_id,
+                audio=audio_file,
+                title=title,
+            )
+
+        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
+        os.remove(audio_path)
+
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Failed to download/play: {e}",
+        )
+
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /play: play single video or enqueue entire playlist."""
+    if not context.args:
+        await update.message.reply_text("Usage: /play <YouTube URL or ID>")
+        return
+
+    url = context.args[0]
+    user_id = update.message.from_user.id
+
+    # Detect playlist URL
+    if "playlist?list=" in url or "&list=" in url:
+        await update.message.reply_text("Enqueuing playlist, please wait...")
+        try:
+            videos = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: extract_playlist_videos(url)
+            )
+            for vid in videos:
+                playlist_manager.enqueue(user_id, vid)
+            await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error extracting playlist: {e}")
+        return
+
+    # Otherwise, play single video
+    await update.message.chat.send_action(action=ChatAction.UPLOAD_AUDIO)
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        title = os.path.basename(audio_path).rsplit(".", 1)[0]
+
+        with open(audio_path, "rb") as audio_file:
+            await update.message.reply_audio(audio=audio_file, title=title)
+
+        storage_manager.record_play(user_id, {"title": title, "url": url, "duration": None})
+        os.remove(audio_path)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not download/play audio: {e}")
+
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /next or /queue: play the next track in the user’s queue."""
+    user_id = update.message.from_user.id
+    next_track = playlist_manager.dequeue(user_id)
+
+    if not next_track:
+        await update.message.reply_text("Your queue is empty. Use /search to add something.")
+        return
+
+    url = next_track["url"]
+    title = next_track.get("title", "Unknown Title")
+    await update.message.chat.send_action(action=ChatAction.UPLOAD_AUDIO)
+
+    try:
+        audio_path = await download_audio_stream(url, user_id)
+        with open(audio_path, "rb") as audio_file:
+            await update.message.reply_audio(audio=audio_file, title=title)
+
+        storage_manager.record_play(user_id, next_track)
+        os.remove(audio_path)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error playing next track: {e}")
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /history: show the last 10 played tracks for this user."""
+    user_id = update.message.from_user.id
+    history = storage_manager.get_history(user_id, limit=10)
+
+    if not history:
+        await update.message.reply_text("No history yet. Use /play or /search to start listening.")
+        return
+
+    lines = []
+    for idx, entry in enumerate(history, start=1):
+        ts = entry["timestamp"]
+        title = entry.get("title", "Unknown Title")
+        url = entry.get("url", "")
+        lines.append(f"{idx}. [{ts[:16]}] {title}\n   {url}")
+
+    reply = "🎧 Your last plays:\n\n" + "\n\n".join(lines)
+    await update.message.reply_text(reply)
+
+def main() -> None:
+    """Start the Telegram bot and register handlers."""
+    token = os.getenv("TELEGRAM_TOKEN")
+    app = ApplicationBuilder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CallbackQueryHandler(play_callback, pattern=r"^play::"))
+    app.add_handler(CommandHandler("play", play_command))
+    app.add_handler(CommandHandler("next", next_command))
+    app.add_handler(CommandHandler("queue", next_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Use /search or /play."))
+    )
+
+    print("Bot is polling...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+
+
+	8.	requirements.txt
+
+python-telegram-bot==22.1
+yt-dlp==2025.5.22
+python-dotenv>=0.21.0
+
+
+	9.	README.md
+
+# YouTube Telegram Music Bot
+
+## Description
+A Telegram bot built with python-telegram-bot that acts as a YouTube client. Users can search for music, playlists, or podcasts; play audio; manage a queue; and view listening history.
+
+## Setup
+1. Clone the repository.
+2. Create a virtual environment with Python 3.8+.
+3. Install dependencies:
+
+pip install -r requirements.txt
+
+4. Ensure `ffmpeg` is installed (`ffmpeg -version` should work).
+5. Create a `.env` file (or set environment variables) with:
+
+TELEGRAM_TOKEN=
+
+6. Run the bot:
+
+python main.py
+
+## File Structure
+
+main.py
+utils/
+init.py
+ytdl_wrapper.py
+playlist_manager.py
+storage.py
+data/
+history.json
+playlists.json
+downloads/        # auto-generated at runtime
+requirements.txt
+README.md
+
+## Commands
+- `/start`: Show welcome message and list commands.
+- `/search <keywords>`: Search YouTube and display top-5 results as inline buttons.
+- `/play <YouTube URL or ID>`: Play a single video immediately or enqueue an entire playlist.
+- `/next` or `/queue`: Play the next track in your queue.
+- `/history`: Show your last 10 plays.
+
+
+	10.	Coding Standards & Best Practices
+	•	Follow PEP 8: 79‐character line length, snake_case for functions and variables, PascalCase for class names.
+	•	Type‐hint all function signatures (e.g., async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:).
+	•	Include docstrings for each function and module. Add # TODO: add unit tests in utility modules.
+	•	Wrap blocking yt-dlp calls with run_in_executor and handle exceptions gracefully.
+	•	Sanitize user inputs: ensure only valid YouTube URLs or IDs are accepted.
+	•	Clean up temporary files immediately after sending the audio to conserve disk space.
+	•	Limit JSON storage size by trimming history to last 100 entries per user.
+	•	Use in‐process JSON files (data/history.json and data/playlists.json) for persistence—no external databases.
+	•	Provide meaningful error messages so users understand when something goes wrong (e.g., “Video unavailable,” “Audio too large, sending YouTube link instead,” etc.).
+
+Implement all files now.```

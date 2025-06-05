@@ -1,0 +1,220 @@
+You are a senior Python engineer. Your task is to build a Telegram bot in Python that acts as a personal YouTube music client. The entire project will run on Replit and should use exactly the following pinned versions and tools:
+	•	python-telegram-bot==22.1
+	•	yt-dlp==2025.5.22
+	•	ffmpeg (installed at system level so yt-dlp can extract audio)
+	•	Python 3.8+
+
+No external databases or services beyond these are allowed. All sensitive values (for example, the Telegram bot token) must be read from environment variables or Replit Secrets.
+
+1. File Tree and Dependencies
+
+Create the following file structure at the root of your Replit project (do not include any extra files):
+	•	main.py
+	•	utils/
+	•	__init__.py
+	•	ytdl_wrapper.py
+	•	playlist_manager.py
+	•	storage.py
+	•	data/
+	•	history.json
+	•	playlists.json
+	•	downloads/
+	•	This folder will be created at runtime to store temporary audio files.
+	•	requirements.txt
+	•	README.md
+
+In requirements.txt, pin exactly:
+
+python-telegram-bot==22.1
+yt-dlp==2025.5.22
+python-dotenv>=0.21.0
+
+Ensure ffmpeg is installed in the Replit environment (use the Replit Packages tab or an apt-get command in a shell if needed).
+
+2. Environment Setup
+	•	Use python-dotenv (or Replit Secrets) to load TELEGRAM_TOKEN at runtime. Do not hardcode any tokens.
+	•	Confirm that running ffmpeg -version works successfully in the Replit shell.
+	•	All modules should follow PEP 8 style, include type hints, and have brief docstrings. Leave “TODO” comments in module files indicating where unit tests should be added later.
+
+3. main.py: Bot Initialization and Command Handlers
+
+In main.py, perform the following tasks:
+	1.	Load environment variables (for example, call load_dotenv() at the top).
+	2.	Initialize a python-telegram-bot Application using ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build().
+	3.	Instantiate your utility managers: one instance of PlaylistManager (from utils/playlist_manager.py) and one instance of StorageManager (from utils/storage.py).
+	4.	Register these command handlers and a callback handler:
+	•	/start: Send a welcome message explaining all available commands. The text should list /search <keywords>, /play <YouTube URL or ID>, /next (or /queue), and /history, plus a brief description of their behaviors.
+	•	/search :
+	•	If no keywords are provided, reply “Usage: /search .”
+	•	Otherwise, send a “typing” chat action, then call into utils/ytdl_wrapper.search_youtube(query, max_results=5) inside an asyncio.get_event_loop().run_in_executor(...) to avoid blocking.
+	•	If no results come back, reply “No results found.”
+	•	Otherwise, construct an inline keyboard with one button per result. Each button’s text should be the track’s title (truncated to 40 characters) plus its duration formatted as “(MM:SS)”. The callback data for each button should be play::<webpage_url>.
+	•	Finally, reply with “Select a track to play or queue:” and attach that inline keyboard.
+	•	CallbackQueryHandler for any callback data matching the pattern ^play:::
+	•	Acknowledge the callback so the loading spinner goes away.
+	•	Extract the URL from the callback data.
+	•	Send a “upload audio” chat action, then call utils/ytdl_wrapper.download_audio_stream(url, user_id) inside run_in_executor(...).
+	•	Once the download completes, open the resulting MP3 file and send it via send_audio(chat_id, audio=file_handle, title=track_title).
+	•	Record that play in storage_manager.record_play(user_id, { "title": track_title, "url": url, "duration": duration_in_seconds }).
+	•	Immediately delete the temporary file from the downloads/ folder.
+	•	If any exception occurs (e.g., download fails, file too large, etc.), catch it and send a user-friendly error message like “❌ Failed to play: .”
+	•	/play :
+	•	If no argument is provided, reply “Usage: /play .”
+	•	If the argument contains playlist?list= or &list=, treat it as a playlist. In that case, send a short reply like “Enqueuing playlist, please wait…,” then call utils/ytdl_wrapper.extract_playlist_videos(playlist_url) inside run_in_executor(...). For each video dict returned, call playlist_manager.enqueue(user_id, track_info) to add it to the user’s queue. Finally, reply “Enqueued  tracks from the playlist.” and return (do not play anything immediately).
+	•	Otherwise, treat it as a single video. Send an “upload audio” chat action, then call download_audio_stream(url, user_id) in an executor. Once downloaded, send the MP3 via reply_audio(audio=file_handle, title=track_title), record it in history, then delete the temporary file. Catch exceptions and reply with a descriptive error if the download fails or the file is too large.
+	•	/next (alias /queue):
+	•	Call playlist_manager.dequeue(user_id).
+	•	If the returned value is None, reply “Your queue is empty. Use /search to add something.”
+	•	Otherwise, extract the next track’s URL, title, and duration. Send an “upload audio” chat action, then download and send the MP3 just as in the /play flow. Record it in history and delete the temp file. Catch and report any errors.
+	•	/history:
+	•	Call storage_manager.get_history(user_id, limit=10).
+	•	If no entries exist, reply “No history yet. Use /play or /search to start listening.”
+	•	Otherwise, build a numbered list of the last plays. Each entry should show a UTC timestamp truncated to “YYYY-MM-DDTHH:MM”, followed by the track title and the YouTube URL on a new line. For example:
+	1.	[2025-06-05T12:34] Song Title
+https://youtu.be/abc123
+	2.	[2025-06-04T09:12] Podcast Episode
+https://youtu.be/xyz456
+	•	Send that entire list as a single reply.
+	•	Fallback MessageHandler for any text that does not match a command: reply “Use /search or /play to interact with the bot.”
+	5.	At the very end of main.py, call app.run_polling() and print “Bot is polling…” to the console.
+
+All I/O with YouTube (searching, playlist extraction, downloading) must happen inside run_in_executor to avoid blocking. After sending every audio file, delete the local copy immediately to conserve disk space.
+
+4. utils/ytdl_wrapper.py: YouTube Interactions
+
+In this module, implement three functions:
+	1.	search_youtube(query: str, max_results: int) → list[dict]
+	•	Use yt-dlp’s ytsearch functionality with options to skip file download and run in “extract_flat” mode.
+	•	Return a list of up to max_results dictionaries, each containing:
+	•	"id": the YouTube video ID
+	•	"title": the video’s title string
+	•	"duration": length in seconds
+	•	"webpage_url": full watch URL
+	•	"thumbnail": thumbnail URL (if available)
+	2.	extract_playlist_videos(playlist_url: str) → list[dict]
+	•	Use yt-dlp in “extract_flat” mode on the playlist URL to return a JSON response containing all entries.
+	•	Return a list of dictionaries, each with keys:
+	•	"id": the video ID
+	•	"title": the video’s title
+	•	"url": a string you can pass back into download_audio_stream (either full URL or ID)
+	•	"duration": length in seconds
+	3.	download_audio_stream(url: str, user_id: int) → str
+	•	Build a per-user folder under downloads/<user_id>/. Ensure the folder exists.
+	•	Prepare yt-dlp options to download only audio, convert to MP3 with a preferred quality of 192 kbps, and save to downloads/<user_id>/%(id)s.%(ext)s.
+	•	In a blocking helper function, call yt_dlp.YoutubeDL(opts).extract_info(url, download=True). After download and post-processing, determine the MP3 filepath (the extractor returns a filename template; replace its extension with “.mp3”).
+	•	Return that absolute filepath. This entire helper must be invoked inside asyncio.get_event_loop().run_in_executor(...) whenever you call it from the bot.
+
+Each function should include type hints, a brief docstring, and handle exceptions so that any downstream caller can catch errors and report them to the user.
+
+5. utils/playlist_manager.py: Queue Management
+
+In this module, build a class PlaylistManager that:
+	•	On initialization, ensures the folder data/ exists and creates playlists.json if it does not exist, with an empty JSON object {}. Load the JSON into a Python dict in memory.
+	•	Implements these methods:
+	1.	enqueue(user_id: int, track_info: dict) → None
+	•	Convert user_id to a string key. Append track_info (which includes at least "id", "title", "url", "duration") to that user’s list in the in-memory dict.
+	•	Write the updated dict back to data/playlists.json with indentation.
+	2.	dequeue(user_id: int) → dict or None
+	•	Convert user_id to a string. Remove and return the first element of that user’s list.
+	•	If the list is empty or does not exist, return None. Save changes back to JSON.
+	3.	peek(user_id: int) → dict or None
+	•	Return the first element in the user’s queue without removing. If none, return None.
+	4.	clear(user_id: int) → None
+	•	Empty the user’s queue. Write back to JSON.
+	5.	list_queue(user_id: int) → list[dict]
+	•	Return the entire list of track dicts for that user, or an empty list.
+
+Each method should be synchronous (because file I/O is quick for single-user usage) and include basic docstrings. Add a “TODO: add unit tests” comment at the top of the file.
+
+6. utils/storage.py: Listening History
+
+In this module, build a class StorageManager that:
+	•	On initialization, ensures the folder data/ exists and creates history.json if it does not exist, with an empty JSON object {}. Load the JSON into memory.
+	•	Implements these methods:
+	1.	record_play(user_id: int, track_info: dict) → None
+	•	Build a new history entry with keys:
+	•	"timestamp": current UTC time in ISO format (e.g., “2025-06-05T12:34:56”).
+	•	"title" from track_info["title"].
+	•	"url" from track_info["url"].
+	•	"duration" from track_info["duration"].
+	•	Append this entry onto that user’s history list (create the list if it does not exist).
+	•	If the user’s history exceeds 100 entries, truncate older ones so only the last 100 remain.
+	•	Write the updated JSON back to data/history.json with indentation.
+	2.	get_history(user_id: int, limit: int = 10) → list[dict]
+	•	Return the last limit entries from that user’s history list, or an empty list if none exist.
+
+Add docstrings and a “TODO: add unit tests” comment at the top. Follow PEP 8 formatting.
+
+7. Download Folder Cleanup (Optional but Recommended)
+	•	On startup (inside main() before polling begins), consider walking through downloads/ and deleting any files older than 1 hour to conserve Replit storage. Document this step in a brief comment in main.py. (Since this bot is only for personal use, deep cleanup logic is optional—but mention it so future maintainers know where to add it.)
+
+8. README.md Contents
+
+The README.md should contain:
+	1.	Project Overview: A one-paragraph description stating this is a Telegram bot that lets a single user search, play, queue, and review history of YouTube audio tracks.
+	2.	Setup Instructions:
+	•	Clone or open the Replit project.
+	•	Create a Python 3.8+ virtual environment (Replit does this automatically).
+	•	Install dependencies with pip install -r requirements.txt.
+	•	Ensure ffmpeg is installed: document how to verify by running ffmpeg -version in the console.
+	•	Create a .env file (or set Replit Secrets) with the variable TELEGRAM_TOKEN=<your_bot_token>.
+	•	Run the bot by executing python main.py.
+	3.	File Structure: List each file and a one-sentence description:
+	•	main.py: Bot initialization, handler registration, polling.
+	•	utils/ytdl_wrapper.py: YouTube searching and audio downloading.
+	•	utils/playlist_manager.py: JSON-backed queue management.
+	•	utils/storage.py: JSON-backed listening history.
+	•	data/history.json: Stores per-user play history.
+	•	data/playlists.json: Stores per-user queues.
+	•	downloads/: Runtime folder for temporary MP3s (auto-generated).
+	•	requirements.txt: Pinned dependencies.
+	•	README.md: This documentation.
+	4.	Usage Instructions: Briefly describe each command (/start, /search, /play, /next or /queue, /history) and note that the only user is you (personal usage), so no authentication or multi-user routing is required beyond using the Telegram from_user.id to keep files separate.
+	5.	Future Improvements (optional): Mention “TODO: Add unit tests for utility modules; consider caching MP3s to avoid redownloading the same track; implement cleanup of old files on startup.”
+
+9. Command Behaviors (Plain English, No Code)
+
+Describe how each user command must behave at runtime:
+	•	/start: Send a single text reply with a greeting and a bulleted list of commands and their one-line descriptions.
+	•	/search :
+	•	If missing <keywords>, send a text reply indicating correct usage.
+	•	Otherwise, show a “typing…” status to the user, then perform a YouTube search for the top 5 results.
+	•	If none found, reply “No results found.”
+	•	If results exist, display them as an inline keyboard—each button labeled with the truncated title plus duration in minutes and seconds. The callback data behind each button must be “play::”. Send a message saying “Select a track to play or queue:” along with the keyboard.
+	•	User taps a search-result button:
+	•	The bot receives a callback update with data “play::”. Acknowledge the callback.
+	•	Show “uploading audio…” status.
+	•	Download just the audio for that URL in MP3 format under downloads/<user_id>/.
+	•	After the file is complete, send it as a Telegram audio message.
+	•	Record that play in the user’s history JSON.
+	•	Delete the local MP3 file immediately.
+	•	If anything fails, send a text reply “❌ Failed to play: .”
+	•	/play :
+	•	If no argument provided, reply “Usage: /play .”
+	•	If the argument is detected as a playlist URL (contains playlist?list= or &list=), reply “Enqueuing playlist, please wait….” Then retrieve all videos in that playlist (title, URL, duration) and add each one to the user’s queue in data/playlists.json. Finally reply “Enqueued  tracks from the playlist.” Do not send audio immediately.
+	•	Otherwise, treat it as a single video: show “uploading audio…” status, download the MP3, send it to the user, record the play in history, and delete the file. If any exception occurs, reply with an error message.
+	•	/next or /queue:
+	•	Attempt to remove the first track from the user’s queue and return it.
+	•	If the queue was empty, reply “Your queue is empty. Use /search to add something.”
+	•	If a track was returned, show “uploading audio…” status, download the audio for that track, send it, record in history, and delete the local file. If an error occurs, reply “❌ Error playing next track: .”
+	•	/history:
+	•	Retrieve up to the last 10 tracks from the user’s history JSON.
+	•	If the list is empty, reply “No history yet. Use /play or /search to start listening.”
+	•	Otherwise, build a numbered list where each entry shows the UTC timestamp truncated to minutes, the track title, and the YouTube URL on the next line. Send that as a single text reply.
+	•	Any other text: Reply “Use /search or /play to interact with the bot.”
+
+10. Performance and Scale
+	•	Although this is for personal use (only you will actually interact), design the code so that downloading and queueing are done asynchronously via run_in_executor to allow the bot to remain responsive if a long download is in progress.
+	•	There is no imposed limit on queue length or history size beyond trimming history to the last 100 plays per user.
+	•	On startup (before run_polling), optionally scan the downloads/ folder and delete any files older than one hour to prevent the disk from filling up on Replit. Document this in a comment in main.py.
+
+11. Error Handling and Edge Cases
+	•	Always wrap yt-dlp and file I/O calls in try/except. On failure, send a user-friendly error.
+	•	If an audio file exceeds Telegram’s 50 MB limit, attempt a retry with a lower bitrate (128 kbps or 96 kbps) and, if it still fails, fall back to sending the YouTube link as a text message with instructions to play directly on YouTube.
+	•	Validate that URLs passed into /play look like YouTube URLs or IDs; if invalid, reply “Invalid YouTube link or ID.”
+	•	If any JSON read/write operation fails (e.g., corrupted file), recreate the JSON file from an empty object and continue gracefully.
+
+12. Unit Testing (Future Work)
+	•	In each of the three utility files (ytdl_wrapper.py, playlist_manager.py, storage.py), include a comment at the top that says “TODO: write pytest unit tests for these functions.”
+	•	The tests should mock yt-dlp’s extraction to ensure search_youtube and download_audio_stream behave as expected without making real network calls.
+	•	For PlaylistManager and StorageManager, write tests that add, remove, truncate, and retrieve data from their respective JSON files. For now, you only need to leave the comments; the actual tests can be added later.
