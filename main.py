@@ -285,11 +285,14 @@ async def predownload_next(user_id):
 async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Start playing the next track in the queue."""
     session = get_session(user_id)
+    logger.info(f"[start_next] user_id={user_id} current_index={session.current_index} queue_len={len(session.queue)} is_paused={session.is_paused}")
     if not session.queue or session.current_index is None:
+        logger.info(f"[start_next] No queue or current_index is None for user_id={user_id}")
         return
 
     track = session.get_current_track()
     if not track:
+        logger.info(f"[start_next] No current track for user_id={user_id}")
         return
 
     try:
@@ -494,15 +497,14 @@ async def start_next(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
                     os.remove(filepath)
                 
                 # Check if there's a next track
+                logger.info(f"[start_next] Finished sending audio for index={session.current_index} queue_len={len(session.queue)}")
                 if session.current_index + 1 < len(session.queue):
-                    # Auto-advance to next track
+                    logger.info(f"[start_next] Auto-advancing to next track for user_id={user_id}")
                     session.current_index += 1
-                    # Small delay to prevent rapid-fire downloads
                     await asyncio.sleep(1)
-                    # Start next track
                     await start_next(context, user_id)
                 else:
-                    # Queue is finished
+                    logger.info(f"[start_next] Queue finished for user_id={user_id}")
                     if session.message_id and session.chat_id:
                         try:
                             # Try to send a new message instead of editing
@@ -568,6 +570,18 @@ async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not session.chat_id:
         session.chat_id = query.message.chat_id
 
+    # Delete the search results inline keyboard message
+    try:
+        await context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
+    except Exception:
+        pass
+    # Delete the user's /search message if available
+    try:
+        if query.message.reply_to_message:
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.reply_to_message.message_id)
+    except Exception:
+        pass
+
     # Get video info to store metadata
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, get_video_info, url)
@@ -593,14 +607,16 @@ async def play_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         session.queue = [track_info]
         session.current_index = 0
         session.is_paused = False
+        logger.info(f"[play_callback] Starting new queue for user_id={user_id}")
         await start_next(context, user_id)
     else:
         # Otherwise, append to queue
         session.queue.append(track_info)
-        added_msg = await query.message.reply_text(f"✅ Added to queue: {track_info['title']}")
-        # Delete the 'Added to queue' message after 2 seconds
-        await asyncio.sleep(2)
+        logger.info(f"[play_callback] Appended to queue for user_id={user_id} queue_len={len(session.queue)}")
+        # Optionally, send a quick confirmation and delete it immediately
         try:
+            added_msg = await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ Added to queue: {track_info['title']}")
+            await asyncio.sleep(1)
             await context.bot.delete_message(chat_id=added_msg.chat_id, message_id=added_msg.message_id)
         except Exception:
             pass
@@ -618,7 +634,6 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Detect playlist URL
     if "playlist?list=" in url or "&list=" in url:
-        await update.message.reply_text("Enqueuing playlist, please wait...")
         try:
             videos = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: extract_playlist_videos(url)
@@ -626,7 +641,19 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             session.queue = videos
             session.current_index = 0
             session.is_paused = False
-            await update.message.reply_text(f"Enqueued {len(videos)} tracks from the playlist.")
+            logger.info(f"[play_command] Enqueued playlist for user_id={user_id} queue_len={len(videos)}")
+            # Delete the user's /play command message
+            try:
+                await context.bot.delete_message(chat_id=update.message.chat_id, message_id=update.message.message_id)
+            except Exception:
+                pass
+            # Optionally, send a quick playlist enqueued notification and delete it
+            try:
+                enq_msg = await context.bot.send_message(chat_id=update.message.chat_id, text=f"🚀 Playlist enqueued: {len(videos)} tracks.")
+                await asyncio.sleep(1)
+                await context.bot.delete_message(chat_id=enq_msg.chat_id, message_id=enq_msg.message_id)
+            except Exception:
+                pass
             await start_next(context, user_id)
         except Exception as e:
             await update.message.reply_text(f"❌ Error extracting playlist: {e}")
@@ -636,6 +663,12 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     session.queue = [{"title": "Unknown", "url": url, "duration": None}]
     session.current_index = 0
     session.is_paused = False
+    logger.info(f"[play_command] Playing single video for user_id={user_id}")
+    # Delete the user's /play command message
+    try:
+        await context.bot.delete_message(chat_id=update.message.chat_id, message_id=update.message.message_id)
+    except Exception:
+        pass
     await start_next(context, user_id)
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
